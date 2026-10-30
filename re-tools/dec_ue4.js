@@ -1,0 +1,12 @@
+const crypto = require('crypto');
+const fs = require('fs');
+const LUA_KEY = Buffer.from('E1671E910EB54736B49908575F08CAFB', 'latin1');
+const b64 = fs.readFileSync('D:/test/cbjq-re/work/ue4lua.b64', 'utf8').trim();
+const data = Buffer.from(b64, 'base64');
+console.log('decoded bytes:', data.length);
+const aligned = data.length - (data.length % 16);
+const d = crypto.createDecipheriv('aes-256-ecb', LUA_KEY, null);
+d.setAutoPadding(false);
+const out = Buffer.concat([d.update(data.subarray(0, aligned)), d.final(), data.subarray(aligned)]);
+fs.writeFileSync('D:/test/cbjq-re/work/UE4_dump.lua', out);
+console.log('decrypted:', out.length, 'head:', out.subarray(0, 40).toString('utf8').replace(/\n/g, ' | '));

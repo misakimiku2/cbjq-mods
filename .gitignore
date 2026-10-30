@@ -1,0 +1,19 @@
+# 构建产物与游戏内容（不入库）
+Game/
+umg_main.enc
+umg_main.lua.dec
+*.pak
+*.log
+node_modules/
+package-lock.json
+
+# 备份与临时
+*.bak*
+*_output.log
+*_install.log
+diag*_output.log
+
+# 运行时状态
+wheel.txt
+fp_key*.txt
+*.pid
