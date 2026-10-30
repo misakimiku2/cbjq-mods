@@ -310,6 +310,89 @@ local function loop()
   pcall(function() UE4.Timer.Add(P.cfg.intervalMs / 1000, loop) end)
 end
 
+-- ============================================================
+-- 全量协议扫描（PROTO SWEEP）
+--   枚举 package.loaded + 所有全局表（深度 3），对每个函数 string.dump，
+--   只把**字节码里含 "CallGS"** 的函数落盘 —— 比全量 dump 小一个量级。
+--   分批跑（每 0.3s 一批），避免一次性卡住主线程。
+-- ============================================================
+local PS = { queue = {}, idx = 1, perTick = 15, scanned = 0, dumped = 0,
+             seen = {}, done = false, visited = {} }
+
+local function collectFns(name, tbl, depth, out)
+  if depth > 3 or PS.visited[tbl] then return end
+  PS.visited[tbl] = true
+  local ok = pcall(function()
+    for k, v in pairs(tbl) do
+      if type(k) == 'string' then
+        if type(v) == 'function' then
+          out[#out + 1] = { name = name .. '.' .. k, fn = v }
+        elseif type(v) == 'table' and depth < 3 then
+          collectFns(name .. '.' .. k, v, depth + 1, out)
+        end
+      end
+    end
+  end)
+end
+
+local function buildQueue()
+  if #PS.queue > 0 then return end
+  local ok = pcall(function()
+    for name, m in pairs(package and package.loaded or {}) do
+      if type(name) == 'string' and type(m) == 'table' then
+        PS.queue[#PS.queue + 1] = { name = 'L:' .. name, tbl = m }
+      end
+    end
+    for k, v in pairs(_G or {}) do
+      if type(k) == 'string' and type(v) == 'table' then
+        PS.queue[#PS.queue + 1] = { name = 'G:' .. k, tbl = v }
+      end
+    end
+  end)
+  lp('PROTO queued', #PS.queue, 'roots=', tostring(ok))
+end
+
+local function protoTick()
+  if PS.done then return end
+  buildQueue()
+  local stopAt = math.min(PS.idx + PS.perTick - 1, #PS.queue)
+  for i = PS.idx, stopAt do
+    local item = PS.queue[i]
+    local fns = {}
+    collectFns(item.name, item.tbl, 1, fns)
+    for _, f in ipairs(fns) do
+      if not PS.seen[f.fn] then
+        PS.seen[f.fn] = true
+        PS.scanned = PS.scanned + 1
+        local ok, bc = pcall(string.dump, f.fn)
+        if ok and type(bc) == 'string' and #bc <= P.cfg.maxDumpBytes then
+          local hit = string.find(bc, 'CallGS', 1, true) or string.find(bc, 'NtfScript', 1, true)
+          if hit then
+            local fname = 'PROTO_' .. string.gsub(f.name, '[^%w_%-]', '_') .. '.luac'
+            local fh = openOut(fname)
+            if fh then
+              pcall(function() fh:write(bc); fh:close() end)
+              PS.dumped = PS.dumped + 1
+            else
+              lp('PROTO noio', fname)
+            end
+          end
+        end
+      end
+    end
+  end
+  PS.idx = stopAt + 1
+  if PS.idx > #PS.queue then
+    PS.done = true
+    lp('PROTODONE roots=', #PS.queue, 'scanned=', PS.scanned, 'dumped=', PS.dumped)
+    return
+  end
+  if PS.idx % 90 < PS.perTick then
+    lp('PROTO progress', PS.idx, '/', #PS.queue, 'dumped=', PS.dumped)
+  end
+  pcall(function() UE4.Timer.Add(0.3, protoTick) end)
+end
+
 -- ---------- 启动 ----------
 -- 与 CamZoomMod 同款时序：立即试一次，不成则挂 Event.Logined 兜底。
 -- ⚠ 不能无条件把 _ready 置 true —— umg_main 加载时 UE4.Timer 可能还没就绪，
@@ -321,6 +404,8 @@ local function start()
     P.started = true
     lp('START interval=', P.cfg.intervalMs, 'maxTicks=', P.cfg.maxTicks,
        'outDir=', P.cfg.outDir)
+    -- 全量协议扫描：延后 6s 起跑，和主扫描错开
+    pcall(function() UE4.Timer.Add(6.0, protoTick) end)
   end
 end
 P.Start = start

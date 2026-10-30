@@ -28,7 +28,7 @@ if (!picked.length) {
   process.exit(0);
 }
 
-const groups = { CAP: [], START: [], GLOBAL: [], GTABLE: [], MDHEAD: [], TICK: [], MOD: [], MODTYPE: [], KEYS: [], FN: [], FILE: [], ERR: [], LOOPERR: [], BCLOAD: [], BCSKIP: [], FNCAP: [], HINT: [], DONE: [] };
+const groups = { CAP: [], START: [], GLOBAL: [], GTABLE: [], MDHEAD: [], TICK: [], MOD: [], MODTYPE: [], KEYS: [], FN: [], FILE: [], ERR: [], LOOPERR: [], BCLOAD: [], BCSKIP: [], FNCAP: [], HINT: [], PROTO: [], PROTODONE: [], DONE: [] };
 const bc = new Map(); // key -> { bytes, total, parts: Map(n->hex) }
 
 for (const s of picked) {
@@ -77,6 +77,8 @@ p('已落盘', groups.FILE, 200);
 p('异常', [...groups.ERR, ...groups.LOOPERR]);
 p('字节码自检', groups.BCLOAD, 40);
 p('跳过的超大函数', groups.BCSKIP);
+p('协议扫描进度', groups.PROTO, 12);
+p('协议扫描完成', groups.PROTODONE);
 p('结束', groups.DONE);
 
 const ticks = groups.TICK;
