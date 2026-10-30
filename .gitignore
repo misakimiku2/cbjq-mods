@@ -17,3 +17,8 @@ diag*_output.log
 wheel.txt
 fp_key*.txt
 *.pid
+
+# 游戏字节码 dump（版权内容，绝不入库）
+_dump/
+*.luac
+.snowbreak-key
