@@ -2,8 +2,130 @@
 
 > 需求：宿舍有拍照模式，但那是限定场景。要的是**游戏场景（战斗/关卡）里的自由镜头**，
 > 用于随意构图拍照。明确要求：不要和滚轮缩放 MOD（CamZoomMod）混在一起。
-> 状态：**v15 已与 CamZoomMod 合并成一个 pak（见下方「共存 —— 已实施」节）**。
+> 状态：**v18 = ESC 退出 + 提示窗精装（嗅探器侧 overlay v2）**；碰撞为 v17 扫掠-滑移版；
+> v15 起与 CamZoomMod 合并成一个 pak（见「共存 —— 已实施」节）。
 > v13/v14 实测结论仍有效，交接快照见下方「当前状态快照」。
+
+---
+
+# ★ v18 ESC 退出 + 提示窗精装（2026-10-30，待实机验证）
+
+**需求（用户原话）**：UI 太简陋要精装，先做按键样式 —— 白描边圆角矩形 + 字母 + 黑色
+投影；ESC 也能退出拍照模式（拍照模式 UI 全隐藏，不搞复杂的排除隐藏）；UI 不要底部
+背景，直接透明。
+
+**改动一：ESC 退出（本 Lua，v18）**
+- `cfg.escVK = 27`；step() 键处理链加 `elseif vks[i] == cfg.escVK and S.on then exit('esc')`
+  （只在拍照模式内生效；拍照模式外 ESC 照常进游戏菜单）。
+- **blockList 追加 27**：拍照模式下嗅探器把 ESC「先记录后吞」—— fp_key.txt 照样收到
+  （我们用它退出），游戏菜单不弹。安全兜底不变：3s 死人开关 + ESC 本身就触发退出解禁。
+- ⚠ 依赖嗅探器白名单放行 ESC：`runtime/wheel_sniffer.py` 的 KEYS_OF_INTEREST 已加
+  0x1B（必须重启嗅探器才生效，见下方运维）。
+
+**改动二：操作提示窗精装（嗅探器侧，wheel_sniffer.py overlay_thread v2）**
+- 纯 GDI+（gdiplusflat via ctypes）画进 PARGB 位图 → `UpdateLayeredWindow`
+  逐像素 alpha。旧 v1 是 GDI 纯色底板 + DrawTextW（**v1 的窗口样式漏了
+  WS_EX_LAYERED**，靠不透明绘制掩盖；v2 已补 0x00080000）。
+- 键帽样式：白描边（2px, α242）圆角矩形（r8）+ 半透明深底（α89）+ 黑色投影
+ （偏移 +3, α115），键帽字母白字黑影、水平垂直居中。
+- 全部文字带黑色投影；标题「自 由 相 机」淡蓝；**整窗无底板**（透明浮在画面上）。
+- 内容（OVL_ROWS）：鼠标 转视角 / W A S D 移动 / E 上升 Q 下降 / 滚轮 变焦 FOV /
+  V 定格时间 / B 进入退出 + **ESC 退出**。
+- 渲染一次静态内容；显示/隐藏逻辑不变（300ms 读 freecam_on.txt）。
+- 出错写 `C:\ProgramData\CamZoomMod\overlay_err.txt`（v1 同款约定）。
+
+**运维（两项都要做才完整生效）**：
+1. pak 已装（v18，游戏需重启加载）。
+2. 嗅探器需管理员重启：**双击 `runtime/restart_sniffer_admin.vbs`**（新增，一次 UAC
+   内完成 杀 pythonw → 等 1.2s → 管理员重启；本 shell 非管理员，杀不掉 elevated 旧进程，
+   所以做了这个一键脚本）。验证：sniffer_state.txt `hooks=on elevated=1`。
+
+**⚠ 首次重启后 UI 仍不出现的修复记录（2026-10-30 深夜）**：
+overlay 线程连踩 4 个坑，靠 `runtime/overlay_test.py`（AST 提取 overlay_thread 原样
+实跑 + 截屏）和 `runtime/gdip_probe*.py` 定位：
+1. `GdipCloseFigure` 不存在 —— flat API 叫 **`GdipClosePathFigure`**（CloseFigure 是
+   托管 API 名）。getattr 失败 → 线程死 → 无 UI（overlay_err.txt 有记录）。
+2. `gp()` 绑定助手签名写错：`gp(name, *argtypes)` 把 restype 也吞进 argtypes，
+   所有绑定多一个参数类型 → 首个调用 GdiplusStartup 就 TypeError。
+3. `GdipCreateStringFormat(attributes, language, &out)` 实参顺序写反。
+4. **本机 gdiplus.dll 的 `GdipMeasureString` 对全有效句柄也 fail-fast（0xC0000409）**
+   —— 探针 1-4：裸调用/argtypes/NULL-format/交换参数全试过，同句柄的 DrawString、
+   GetFontHeight 都正常；layoutRect=NULL 优雅返回 InvalidParameter，非 NULL 必崩。
+   **测宽已弃用 GDI+，改 GDI GetTextExtentPoint32W**（同字体文件，±1px 由键帽
+   12px padding 吸收），GDI+ 只负责绘制（DrawString/路径/ULW 实测正常）。
+   ⚠ 给以后任何 GDI+ 工作的教训：**MeasureString 在本机不可用，测宽走 GDI。**
+修复后 `overlay_test.py` 实跑验证：窗口创建且可见、截图确认键帽样式/透明底/六行
+内容完整（含 ESC 行）。
+
+**复验清单**：B 进入 → 提示窗为键帽样式、无底板；按 ESC → 直接退出且游戏菜单不弹；
+拍照模式外按 ESC → 游戏菜单正常；B 进出回归正常。
+
+---
+
+# ★ v17 贴墙抽搐修复（2026-10-30 实机反馈，待复验）
+
+**实机反馈（v16）**：碰撞生效、效果不错，但镜头贴墙后继续按方向键会**抽搐**。
+
+**根因（机制推演）**：v16 把 6cm 安全间距做在「命中后沿视线回退」上 —— 贴墙续推时
+每帧先自由逼近（间距区内扫掠不命中），触碰瞬间又被钳回 6cm 之外，位置 16↔13cm
+每 2-3 帧 ping-pong 一个循环，画面抽搐。
+
+**修法（v17）**：
+- 间距并进球掠半径：**扫掠半径 = colRadius+colSkin（16cm）**，扫掠 sphere 本身
+  带着安全间距去撞 —— 命中时球心就已经在「应停位置」；
+- 命中响应改**扫掠-滑移**：去掉本帧位移里压入表面的法向分量
+ （into = dot(位移, 法线)），保留切向分量（乘 1-t，t 由 Location 反推，不读 Time 字段）。
+  效果：正对墙推入 → 停在原地不回弹（t=0 命中 → 位置不变）；斜推/贴墙平移 →
+  精确沿墙滑行；擦边命中（into ≥ -0.01cm）→ 放行；
+- **贴墙 standoff 不变**（相机中心离墙 ≥16cm），观感与 v16 一致；
+- 起点陷入几何：MTD 推出改「刚脱出」（depth+0.5）；窄缝连续陷入（consec）→ 推力减半
+  收敛，防左右墙来回弹；pawn 让行推进量改为 扫掠半径+2cm。
+
+**复验清单**：贴墙后按住方向键 → 应稳定贴墙不抽搐；斜 45° 推墙 → 沿墙滑行；
+贴墙平移 → 顺滑；远离墙 → 立即恢复自由；其余同 v16 清单（不穿地/角色不挡/定格有效/共存回归）。
+
+---
+
+# ★ v16 相机碰撞 —— 已实机验证：生效，但贴墙续推抽搐（v17 已修）（2026-10-30）
+
+需求（用户原话）：拍照模式 MOD 会穿过所有游戏中场景的模型，要加碰撞效果。
+
+**根因**：自由相机是我们 spawn 的 `ACameraActor`，无体积、位置逐帧直写 —— 穿墙是必然。
+
+**方案（`protov1.lua` v16）**：每帧对「上一帧落点 → 本帧目标点」的位移做
+`SphereTraceSingle` 球体扫掠（默认 Visibility 通道、半径 10cm），命中场景几何就把
+落点钳在命中面前 6cm（`colSkin`）。要点：
+- **滑墙是天然行为**：平行于墙面的位移扫掠不命中，只有直冲墙的位移被吃掉；
+- **角色（pawn，ECC_Pawn=2）放行** —— 拍摄对象就是角色，被胶囊挡住就没法拍特写。
+  pawn 命中的处理：起点沿视线推进 半径+2cm 后重扫（最多 4 次），让过 pawn 后
+  余下路径照常可能撞墙；
+- **起点陷进几何**（进相机时 POV 本来就贴墙）→ 沿 MTD 法线推出（PenetrationDepth+skin）；
+- **可靠性原则**：任何接口故障都放行（宁可暂时穿墙，不可卡死相机），
+  `COL err` 日志上限 5 条；FHitResult 字段全部读不到则自动停用碰撞（`COL dead`）。
+
+**可调参数**（`cfg.col*`）：`colOn` 总开关 / `colRadius` 10 / `colSkin` 6 /
+`colChannel` 1（Visibility，穿墙照旧或误挡过多换 2=Camera）/ `colComplex` /
+`colMaxRetry` 4。
+
+**结构改动**：`update()` 里相机写入从第 3 步移到第 5 步（滚轮推拉+WASD 并入
+`S.pos` 后先做碰撞解析再写回，位移当帧生效且必经碰撞）；`enter()` 初始化
+`S.colPrev`（扫掠起点）、`exit()` 清空。对 camzoom 无影响（未碰 FreeCamActive 协议）。
+
+**日志判读**（`grep FreeCam .../Saved/Logs/Game.log`）：
+- `freecam v16 injected` / `freecam v16 online` —— 新版本已加载
+- `COL online r=10 skin=6 channel=1` —— 扫掠接口通（首次移动后打一次）
+- `COL hit at=... actor=...` —— 命中场景并钳制（上限 5 条）
+- `COL skip pawn ...` —— 角色让行（上限 10 条）
+- `COL err ...` —— 接口故障（碰撞已放行，需排查绑定问题）
+- `COL FHitResult 字段不可读 → 碰撞停用` —— 结构绑定问题，需换读法
+
+**待实机验证清单**：
+1. 飞向墙面 → 停在表面前（不再穿墙），贴墙平移顺滑
+2. E/Q 下沉 → 不穿地
+3. 贴近角色拍特写 → 角色不挡（skip pawn）
+4. V 定格后移动 → 仍有碰撞（trace 不受时间膨胀影响）
+5. v92 共存五项回归：camzoom 推近/拉远/居中/开镜/切人不受影响
+6. B 进出正常，退出后 UI/滚轮缩放恢复
 
 ---
 
@@ -118,9 +240,9 @@
 
 | 项 | 值 |
 | --- | --- |
-| 源 | `work/freecam/protov1.lua`（v15，含 FreeCamActive 共存开关） |
+| 源 | `work/freecam/protov1.lua`（v18，共存开关 + 碰撞·扫掠滑移 + ESC 退出） |
 | 构建 | **`cd work && node build_both.js`（v92 起用这个：camzoom+freecam 一起打进一个 pak）；`build_freecam.js` 只在需要单独构建 freecam 时用** |
-| 产物 | `work/merged-mod-new.pak`（302,503 字节）→ 安装为 `Patch_CamZoomMod-Windows_100_P.pak` |
+| 产物 | `work/merged-mod-new.pak`（329,251 字节）→ 安装为 `Patch_CamZoomMod-Windows_100_P.pak` |
 | 安装 | 手动 cp（旧的 install_freecam.sh / restore_camzoom.sh 是单 MOD 时代的换装脚本，留着备查） |
 | 目标 | `E:/SeasunCBJQos/Game/cbjq/game/Game/Content/Paks/Patch_CamZoomMod-Windows_100_P.pak` |
 | Lua Key | `E1671E910EB54736B49908575F08CAFB`（AES-256-ECB，无 padding） |

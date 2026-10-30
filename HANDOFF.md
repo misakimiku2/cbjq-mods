@@ -40,7 +40,9 @@
 
 - 当前版本：**v92**（v87 清理版 + FreeCamMod 共存挂起），源码 `work/camzoom/proto49.lua`
 - 已安装：`E:\SeasunCBJQos\Game\cbjq\game\Game\Content\Paks\Patch_CamZoomMod-Windows_100_P.pak`
-  （302,503 字节，**内含 CamZoomMod v92 + FreeCamMod v15 两个 MOD**，构建脚本 `work/build_both.js`）
+  （329,251 字节，**内含 CamZoomMod v92 + FreeCamMod v18 两个 MOD**，构建脚本 `work/build_both.js`；
+  freecam v18 = v17 碰撞·扫掠滑移 + ESC 退出，提示窗精装在嗅探器侧（overlay v2），
+  见 `work/freecam/HANDOFF.md`）
 
 ### ★ v92 合并（2026-10-30）：与 FreeCamMod（自由相机拍照）共存
 
@@ -826,7 +828,7 @@ Lua 侧 `pollFPKey()` 每帧读、按 seq 去重。`settings` 里 `fpKeyVK=86`�
 | 路径 | 说明 |
 |---|---|
 | `work/camzoom/proto49.lua` | **v92 当前注入源**（v87 清理版 + FreeCamMod 共存挂起；单独构建也用它，共存代码在无 freecam 时是空操作） |
-| `work/freecam/protov1.lua` | **FreeCamMod v15 当前注入源**（含 FreeCamActive 开关；进度文件 `work/freecam/HANDOFF.md`） |
+| `work/freecam/protov1.lua` | **FreeCamMod v18 当前注入源**（共存开关 + 碰撞 + ESC 退出；进度文件 `work/freecam/HANDOFF.md`） |
 | `work/build_both.js` | **v92 起的一键构建**：两份源码一起注入 → luaparse lint → repak 打包 → `merged-mod-new.pak` |
 | `work/build_mod.js` | 旧的单 camzoom 构建（源码指针已过时：还指向 proto49 但产物不含 freecam；要用需先改回） |
 | `work/build_freecam.js` | 旧的单 freecam 构建（含 freecam 侧耦合检查；合并检查已并入 build_both.js） |

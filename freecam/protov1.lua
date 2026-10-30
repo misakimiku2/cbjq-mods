@@ -1,5 +1,5 @@
 -- ========================================================
--- @File    : FreeCam.lua (v1)
+-- @File    : FreeCam.lua (v18)
 -- @Brief   : 游戏场景自由相机（独立于 CamZoomMod）
 --
 -- 基于 probe v1/v2 的实机结论：
@@ -17,6 +17,22 @@
 --   滚轮     沿视线前进 / 后退
 --   F8      开关定格（时间膨胀 0.02）
 --   退出/换图/嗅探器失联 → 自动还原
+--
+-- v16 追加：相机碰撞 —— 相机 Actor 无体积、位置逐帧直写，天然穿墙。
+--   每帧对「上一帧落点 → 本帧目标点」做 SphereTraceSingle 球体扫掠，命中场景
+--   几何就把落点钳在表面前几 cm；角色（pawn）放行（拍照对象就是角色）。
+--   接口故障一律放行并打 COL err 日志，绝不因碰撞卡死相机。
+--
+-- v17 修正：贴墙续推时的周期性回弹（画面抽搐，实机反馈）。
+--   根因：v16 把 6cm 安全间距做成「命中后沿视线回退」，贴墙续推时每帧
+--   先自由逼近（间距区内扫掠不命中）、触碰瞬间又被弹回 —— 2-3 帧一个
+--   循环（16↔13cm ping-pong），肉眼可见抽搐。
+--   v17 把间距并进球掠半径（扫掠半径 = colRadius+colSkin），命中响应改为
+--   「扫掠-滑移」：只去掉位移里压入表面的法向分量，命中不回退 ——
+--   正对墙推入稳定停在原地，斜推/贴墙平移顺滑滑行。
+--
+-- v18 追加：ESC 退出拍照模式（操作提示窗的精装键帽版在嗅探器侧：
+--   runtime/wheel_sniffer.py 的 overlay_thread v2，GDI+ 键帽样式、无底板）。
 --
 -- 输入通道沿用 CamZoomSniffer 的两个文件（嗅探器与本 MOD 无关，一直在后台跑）：
 --   C:\ProgramData\CamZoomMod\fp_key.txt   "seq vk"   -- 键盘
@@ -56,6 +72,7 @@ local cfg = {
   --   F7/F8 已在源码里加入白名单，重编并重启嗅探器后可改回 F7/F8。
   toggleVK     = 66,    -- B
   freezeVK     = 86,    -- V
+  escVK        = 27,    -- ESC：拍照模式下 UI 全隐藏，ESC 直接退出（v18，用户要求）
   ipcKeyPath   = 'C:\\ProgramData\\CamZoomMod\\fp_key.txt',
   ipcWheelPath = 'C:\\ProgramData\\CamZoomMod\\wheel.txt',
   ipcHeldPath  = 'C:\\ProgramData\\CamZoomMod\\keys_held.txt',  -- 持续按住的键（走位用）
@@ -84,14 +101,32 @@ local cfg = {
   --   LShift=160 RShift=161 LAlt=164 RAlt=165。写 17/16 挡不住左 Ctrl/左 Shift！
   -- ⚠ 必须排除：W/A/S/D 不在黑名单（走位轴要游戏收得到才有值；
   --   相机的 WASD 走位走 keys_held 通道，两路在 update() 里合并）、
-  --   Esc(27)/Alt(164,165)/Win(91,92)（保命出口，Alt+Tab 别吞）。
+  --   Alt(164,165)/Win(91,92)（保命出口，Alt+Tab 别吞）。
+  --   Esc(27) 在名单里（v18）：拍照模式下 ESC 由 MOD 截下做「退出」，
+  --   游戏菜单不该弹。它是「先记录后吞」，我们照样能收到；且吞键有 3s
+  --   死人开关、ESC 自己就触发退出解禁，不会锁死。
   -- ⚠ cfg 里同名键只能有一个：曾因残留第二个 blockList='' 把名单覆盖，
   --   表现为屏蔽整体失效且日志只有 BLOCK 0，极难排查。
-  blockList    = '1 2 10 32 17 16 160 161 162 163 81 69 90 88 82 70 71 67 86 66 84 89 85 73 79 80 72 74 75 76 77 78 188 190 191 49 50 51 52 53 54 55 56 57 48 87 65 83 68',
+  blockList    = '1 2 10 32 17 16 160 161 162 163 81 69 90 88 82 70 71 67 86 66 84 89 85 73 79 80 72 74 75 76 77 78 188 190 191 49 50 51 52 53 54 55 56 57 48 87 65 83 68 27',
   hudRehide    = 12,    -- 每隔多少帧重新压一次 UI 透明度（游戏会自己改回来）
   freezeRate   = 0.02,  -- 定格时的时间缩放；用 0.02 不用 0，避免系统级组件异常
   beatTimeout  = 15.0,  -- 嗅探器心跳停这么久 → 自动退出，防止卡死在自由相机里出不来
   minGameplay  = 1,     -- 必须处于 gameplay 才允许进入
+  -- ===== 相机碰撞（v17）=====
+  -- 现象：相机 Actor 无体积、位置逐帧直写，会穿过一切场景模型。
+  -- 方案：每帧对「上一帧落点 → 本帧目标点」的位移做 SphereTraceSingle 球体扫掠，
+  --   扫掠半径 = colRadius+colSkin（贴墙安全间距做进球体里），命中做「扫掠-滑移」：
+  --   去掉位移里压入表面的法向分量、保留切向分量 —— 命中不回退，贴墙续推
+  --   稳定停在原地（v16 的「命中后回退 colSkin」会 2-3 帧一循环地弹跳=抽搐，已废）。
+  -- 角色（pawn）不拦 —— 拍摄对象就是角色，被胶囊挡住就没法拍特写；
+  --   pawn 命中时起点沿视线推进 扫掠半径+2cm 重扫（最多 colMaxRetry 次）。
+  -- 接口故障一律放行（宁可暂时穿墙，不可卡死相机），所有失败都有 COL err 日志。
+  colOn        = true,   -- 碰撞总开关
+  colRadius    = 10.0,   -- 相机体积（球半径 cm）
+  colSkin      = 6.0,    -- 贴墙安全间距（并入扫掠半径；相机中心离墙 ≥ 两者之和）
+  colChannel   = 1,      -- ETraceTypeQuery：1=Visibility 2=Camera；穿墙照旧或误挡过多就换 2
+  colComplex   = false,  -- true=对复杂碰撞面扫描（贴合模型但更慢）
+  colMaxRetry  = 4,      -- 遇 pawn 跳过重扫的最多次数
 }
 
 local S = {
@@ -119,6 +154,7 @@ local S = {
   usingKeyFile = false,
   errors = 0,
   apiLogged = false,
+  colPrev = nil,        -- 上一帧碰撞解析后的落点（下一帧扫掠起点，v16）
 }
 
 -- ============================================================
@@ -338,9 +374,8 @@ end
 -- 游戏内 UMG 隐藏/还原（v6 的教训：脚本删代码时把这三个函数误删了，
 -- 导致主循环每 12 帧报 nil 调用、MOD 整个死掉、看起来像"所有问题都回归"。
 -- 现在只隐藏根 widget 的透明度，不用 Collapse —— 游戏会自己改回来）
-local HELP = '【自由相机】鼠标 转视角 | W/S 前后 | A/D 左右\n' ..
-             'E 上升 / Q 下降 | 滚轮 FOV\n' ..
-             'V 定格（时间冻结）| B 退出'
+local HELP = '【自由相机】鼠标 转视角 | W/A/S/D 移动 | E/Q 升降\n' ..
+             '滚轮 FOV | V 定格（时间冻结）| B 进入/退出 | ESC 退出'
 
 local function hudCollect()
   local pc = getPC()
@@ -539,6 +574,7 @@ local function enter()
   -- 21:9 屏上就会左右留出黑边。关掉它，让引擎按实际视口比例出画面。
   applyAspect(S.camComp)
   S.pos = start
+  S.colPrev = { X = start.X, Y = start.Y, Z = start.Z }  -- 碰撞扫掠起点（v16）
   S.yaw = yaw
   S.pitch = pitch
   S.pendingDolly = 0
@@ -622,7 +658,200 @@ local function exit(reason)
   end
   S.freeze = false
   S.on = false
+  S.colPrev = nil
   lp('EXIT ' .. tostring(reason or ''))
+end
+
+-- ============================================================
+-- 相机碰撞（v17）：SphereTrace 球体扫掠 + 扫掠-滑移
+-- ------------------------------------------------------------
+-- 相机是我们 spawn 的 ACameraActor，无体积、位置逐帧直写 —— 穿墙是必然。
+-- 方案：每帧把「上一帧落点 → 本帧目标点」的位移做一次球体扫掠，
+--   扫掠半径 = colRadius + colSkin（贴墙安全间距直接做进球体里）。
+--   命中场景几何 → 「扫掠-滑移」：去掉本帧位移里压入表面的法向分量，
+--   保留切向分量 —— 正对墙推入稳定停在原地（不回退、不抽搐），
+--   斜推/贴墙平移沿墙滑行，擦边命中（法向分量≈0）直接放行。
+--   ⚠ v16 教训：把间距做成「命中后沿视线回退 colSkin」，贴墙续推时
+--   「逼近→触碰→弹回6cm」2-3 帧一个循环，画面抽搐 —— 已废。
+-- 角色（pawn，碰撞对象类型 ECC_Pawn=2）不拦 —— 拍摄对象就是角色，被胶囊
+--   挡住就没法拍特写；pawn 命中的处理是起点沿视线推进 扫掠半径+2cm 后重扫
+--   （最多 cfg.colMaxRetry 次），把 pawn「让」过去，余下路径照常可能撞墙。
+-- 起点已陷入几何（进相机时 POV 贴墙等）→ 沿 MTD 法线推出；窄缝里连续陷入
+--   （左右墙都顶）时推力减半收敛，防左右来回弹。
+-- 可靠性原则：任何接口故障都放行（宁可暂时穿墙，不可卡死相机），并打日志。
+-- ============================================================
+local COL = { dead = false, online = false,
+              hitLogged = 0, skipLogged = 0, errLogged = 0,
+              penFrame = nil, cOn = nil, cHit = nil }
+
+local function colColor(r, g, b)
+  local ok, c = pcall(UE4.UKismetMathLibrary.MakeColor, r, g, b, 1)
+  if ok and c ~= nil then return c end
+  local ok2, c2 = pcall(function() return UE4.FLinearColor(r, g, b, 1) end)
+  if ok2 then return c2 end
+  return nil
+end
+
+local function colField(res, name)
+  local v
+  pcall(function() v = res[name] end)
+  return v
+end
+
+-- 单次扫掠。返回 hit(bool), res(FHitResult), err(string|nil)
+local function colSweep(from, to)
+  local ctx = getIns()
+  if ctx == nil then return false, nil, 'no ctx' end
+  if COL.cOn == nil then
+    COL.cOn = colColor(1, 0, 0)
+    COL.cHit = colColor(0, 1, 0)
+  end
+  local ok, hit, res = pcall(UE4.UKismetSystemLibrary.SphereTraceSingle,
+      ctx,
+      UE4.FVector(from.X, from.Y, from.Z),
+      UE4.FVector(to.X, to.Y, to.Z),
+      cfg.colRadius + cfg.colSkin, cfg.colChannel, cfg.colComplex == true,
+      {}, 0, false, COL.cOn, COL.cHit, 0.0)
+  if not ok then
+    -- 个别绑定对空 Lua 表当 TArray 参数挑剔：换 nil 再试一次
+    local ok2, hit2, res2 = pcall(UE4.UKismetSystemLibrary.SphereTraceSingle,
+        ctx,
+        UE4.FVector(from.X, from.Y, from.Z),
+        UE4.FVector(to.X, to.Y, to.Z),
+        cfg.colRadius + cfg.colSkin, cfg.colChannel, cfg.colComplex == true,
+        nil, 0, false, COL.cOn, COL.cHit, 0.0)
+    if ok2 then return hit2 == true, res2, nil end
+    return false, nil, tostring(hit) .. ' / nil-retry: ' .. tostring(hit2)
+  end
+  return hit == true, res, nil
+end
+
+-- 把「上一帧落点 fromPos → 本帧目标 toPos」的位移对场景做碰撞解析。
+-- 返回解析后的落点（无阻挡 / 故障时 = toPos 原样放行）。
+local function colResolve(fromPos, toPos)
+  local dx = toPos.X - fromPos.X
+  local dy = toPos.Y - fromPos.Y
+  local dz = toPos.Z - fromPos.Z
+  local total = math.sqrt(dx * dx + dy * dy + dz * dz)
+  if total < 0.05 then return toPos end   -- 基本没动，不查（纯转视角的帧零开销）
+  local ux, uy, uz = dx / total, dy / total, dz / total
+
+  local cur = { X = fromPos.X, Y = fromPos.Y, Z = fromPos.Z }
+  for i = 1, (cfg.colMaxRetry or 4) do
+    local hit, res, err = colSweep(cur, toPos)
+    if err ~= nil then
+      if COL.errLogged < 5 then
+        COL.errLogged = COL.errLogged + 1
+        lp('COL err ' .. err)
+      end
+      return toPos                          -- 接口故障：放行
+    end
+    if not COL.online then
+      COL.online = true
+      lp('COL online r=' .. fmt(cfg.colRadius, 0) .. ' skin=' .. fmt(cfg.colSkin, 0) ..
+         ' channel=' .. tostring(cfg.colChannel) .. ' complex=' .. tostring(cfg.colComplex))
+    end
+    if not hit or res == nil then
+      return toPos                          -- 无阻挡
+    end
+
+    local otype = nil
+    local comp = colField(res, 'HitComponent')
+    if comp ~= nil then pcall(function() otype = comp:GetCollisionObjectType() end) end
+    if otype == nil then
+      -- GetCollisionObjectType 不可用时的兜底：只有 pawn 才有 GetController
+      local actor0 = colField(res, 'HitActor')
+      if actor0 ~= nil and hasMethod(actor0, 'GetController') then otype = 2 end
+    end
+    local blocking = colField(res, 'bBlockingHit')
+    local pen = colField(res, 'bStartPenetrating')
+    local loc = colField(res, 'Location')
+    if loc == nil and blocking == nil and pen == nil and otype == nil then
+      COL.dead = true
+      lp('COL FHitResult 字段不可读 → 碰撞停用（不拦截，镜头照常自由）')
+      return toPos
+    end
+
+    if otype == 2 then
+      -- 角色：让行 —— 起点沿视线推进 半径+2cm 再扫，余下路径还可能撞墙
+      if COL.skipLogged < 10 then
+        COL.skipLogged = COL.skipLogged + 1
+        local actor = colField(res, 'HitActor')
+        lp('COL skip pawn ' .. pathOf(actor))
+      end
+      local adv = cfg.colRadius + cfg.colSkin + 2.0
+      local nx = cur.X + ux * adv
+      local ny = cur.Y + uy * adv
+      local nz = cur.Z + uz * adv
+      local rx = nx - toPos.X
+      local ry = ny - toPos.Y
+      local rz = nz - toPos.Z
+      if rx * ux + ry * uy + rz * uz >= 0 then return toPos end  -- 已越过目标
+      cur = { X = nx, Y = ny, Z = nz }
+    elseif pen then
+      -- 起点已陷进几何里（进相机时 POV 贴墙 / 窄缝挤压）：沿 MTD 法线推出。
+      -- v17：贴墙间距已并进球掠半径，推到「刚脱出」即可（+0.5 防浮点反复触发）；
+      -- 连续两帧以上都陷入（窄缝里左右墙都顶）→ 推力减半收敛，防左右来回弹。
+      local nrm = colField(res, 'Normal')
+      local depth = tonumber(colField(res, 'PenetrationDepth')) or 0
+      local nx, ny, nz = 0, 0, 1
+      if nrm ~= nil and nrm.X ~= nil then nx, ny, nz = nrm.X, nrm.Y, nrm.Z end
+      local consec = (COL.penFrame ~= nil and (S.frame - COL.penFrame) <= 2)
+      COL.penFrame = S.frame
+      local push = depth + 0.5
+      if consec then push = depth * 0.5 end
+      if COL.errLogged < 5 then
+        COL.errLogged = COL.errLogged + 1
+        lp('COL depen depth=' .. fmt(depth, 1) .. ' consec=' .. tostring(consec))
+      end
+      return { X = cur.X + nx * push, Y = cur.Y + ny * push, Z = cur.Z + nz * push }
+    elseif blocking then
+      -- 场景命中：扫掠-滑移（v17，替代 v16 的「命中后回退」—— 那会周期性回弹抽搐）。
+      -- 球扫掠的 Location = 命中瞬间球心位置；响应 = 去掉本帧位移里压入表面的
+      -- 法向分量、保留切向分量：正对墙推入 → 停在原地不回弹；
+      -- 斜推/贴墙平移 → 沿墙滑行；擦边命中（into≈0）直接放行。
+      local nrm = colField(res, 'Normal')
+      local nx, ny, nz = 0, 0, 1
+      if nrm ~= nil and nrm.X ~= nil then nx, ny, nz = nrm.X, nrm.Y, nrm.Z end
+      local segx, segy, segz = toPos.X - cur.X, toPos.Y - cur.Y, toPos.Z - cur.Z
+      local into = segx * nx + segy * ny + segz * nz
+      if into > -0.01 then
+        return toPos          -- 切向/背离运动：球体不会陷入，不拦（贴墙平移靠这条放行）
+      end
+      local cx, cy, cz
+      if loc ~= nil and loc.X ~= nil then
+        cx, cy, cz = loc.X, loc.Y, loc.Z
+      else
+        local imp = colField(res, 'ImpactPoint')
+        if imp == nil or imp.X == nil then return toPos end
+        local R = cfg.colRadius + cfg.colSkin
+        cx, cy, cz = imp.X + nx * R, imp.Y + ny * R, imp.Z + nz * R
+      end
+      -- 命中发生在本段位移的哪个位置：t = |Location - cur| / 段长（比读 Time 字段稳）
+      local sub = math.sqrt(segx * segx + segy * segy + segz * segz)
+      local t = 0.0
+      if sub > 0.0001 then
+        local dx0, dy0, dz0 = cx - cur.X, cy - cur.Y, cz - cur.Z
+        t = math.sqrt(dx0 * dx0 + dy0 * dy0 + dz0 * dz0) / sub
+        if t < 0 then t = 0 end
+        if t > 1 then t = 1 end
+      end
+      local remain = 1.0 - t
+      local fx = cx + (segx - nx * into) * remain
+      local fy = cy + (segy - ny * into) * remain
+      local fz = cz + (segz - nz * into) * remain
+      if COL.hitLogged < 5 then
+        COL.hitLogged = COL.hitLogged + 1
+        local actor = colField(res, 'HitActor')
+        lp('COL hit t=' .. fmt(t, 2) .. ' at=' .. fmt(fx, 0) .. ',' .. fmt(fy, 0) .. ',' ..
+           fmt(fz, 0) .. ' actor=' .. pathOf(actor))
+      end
+      return { X = fx, Y = fy, Z = fz }
+    else
+      return toPos     -- 非阻挡命中（触发器/重叠体等）：当没撞到
+    end
+  end
+  return toPos         -- 重试用尽（比如大体积 pawn 挡满全路径）：放行
 end
 
 -- ============================================================
@@ -674,15 +903,7 @@ local function update(dt, pc, pcm)
     S.pos = { X = S.pos.X + fwd.X * step, Y = S.pos.Y + fwd.Y * step, Z = S.pos.Z + fwd.Z * step }
   end
 
-  -- 3) 写回相机 Actor
-  pcall(function()
-    S.camActor:K2_SetActorLocation(UE4.FVector(S.pos.X, S.pos.Y, S.pos.Z), false, nil, false)
-  end)
-  pcall(function()
-    S.camActor:K2_SetActorRotation(UE4.UKismetMathLibrary.MakeRotator(0, S.pitch, S.yaw), false)
-  end)
-
-  -- 4) 走位：两条通道并行，谁有值用谁。
+  -- 3) 走位：两条通道并行，谁有值用谁。
   --    A) 引擎内输入轴（不需要嗅探器）—— 优先
   --    B) keys_held.txt（嗅探器 v2+ 才有，旧进程不会写这个文件）
   --    Q/E 升降只有 B 通道有，A 通道先记下来再说。
@@ -755,7 +976,24 @@ local function update(dt, pc, pcm)
     end
   end
 
-  -- 5) 压住 shake，否则开枪/受击会抖（v2 已确认 StopAllCameraShakes 存在）
+  -- 4) 相机碰撞（v17）：本帧位移对场景做球体扫掠，命中做「扫掠-滑移」不回退。
+  --    放在这里的原因：滚轮推拉（第 2 步）和 WASD（第 3 步）都已并入 S.pos，
+  --    一次扫掠覆盖全部位移；解析完立刻写回，位移当帧生效且必经碰撞。
+  if cfg.colOn and not COL.dead then
+    local okC, np = pcall(colResolve, S.colPrev or S.pos, S.pos)
+    if okC and np ~= nil then S.pos = np end
+  end
+  S.colPrev = { X = S.pos.X, Y = S.pos.Y, Z = S.pos.Z }
+
+  -- 5) 写回相机 Actor（v16 起移到碰撞解析之后）
+  pcall(function()
+    S.camActor:K2_SetActorLocation(UE4.FVector(S.pos.X, S.pos.Y, S.pos.Z), false, nil, false)
+  end)
+  pcall(function()
+    S.camActor:K2_SetActorRotation(UE4.UKismetMathLibrary.MakeRotator(0, S.pitch, S.yaw), false)
+  end)
+
+  -- 6) 压住 shake，否则开枪/受击会抖（v2 已确认 StopAllCameraShakes 存在）
   if S.frame % 5 == 0 then
     pcall(function() pcm:StopAllCameraShakes(true) end)
   end
@@ -787,7 +1025,7 @@ local function update(dt, pc, pcm)
     end
   end
 
-  -- 6) UI 维护：游戏自己的逻辑会周期性把透明度改回来，所以要反复压；
+  -- 7) UI 维护：游戏自己的逻辑会周期性把透明度改回来，所以要反复压；
   --    另外延迟创建的 widget（伤害数字、提示条）也要补进来。
   if S.frame % cfg.hudRehide == 0 then
     if S.frame - HUD.lastCollect > 100 then
@@ -798,7 +1036,7 @@ local function update(dt, pc, pcm)
     hudHide()
   end
 
-  -- 7) ViewTarget 守护：被抢回就重挂，但**连续被抢就立刻让位退出**。
+  -- 8) ViewTarget 守护：被抢回就重挂，但**连续被抢就立刻让位退出**。
   --    游戏在剧情/切人/过场等状态会每帧强制收归视点，跟它抢的结果就是画面
   --    抽搐 + FOV 来回跳（v9 实测）。让位 = 退出自由相机，用户过完这段再按 B 进来。
   if S.frame % 3 == 0 then
@@ -863,6 +1101,8 @@ local function step()
         else
           lp('IGNORED 非 gameplay 场景')
         end
+      elseif vks[i] == cfg.escVK and S.on then
+        exit('esc')            -- v18：ESC 退出（拍照模式下 UI 全隐藏，最顺手的出口）
       elseif vks[i] == cfg.freezeVK and S.on then
         local ins = getIns()
         if ins ~= nil then
@@ -917,7 +1157,7 @@ FreeCam.Start = function()
   local ok = pcall(function() UE4.Timer.Add(0.5, loop) end)
   if ok then
     _started = true
-    lp('freecam v15 online  B=开关自由相机  V=定格  鼠标=转视角  WASD=走位  滚轮=FOV')
+    lp('freecam v18 online  B=开关自由相机  ESC=退出  V=定格  鼠标=转视角  WASD=走位  滚轮=FOV  碰撞=开')
   end
 end
 
@@ -938,6 +1178,6 @@ pcall(function()
   end)
 end)
 
-lp('freecam v15 injected (FreeCamActive flag on)')
+lp('freecam v18 injected (FreeCamActive flag on)')
 
 end -- FreeCam guard
