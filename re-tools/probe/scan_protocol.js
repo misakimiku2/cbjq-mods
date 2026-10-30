@@ -34,6 +34,11 @@ const FILTER = (process.argv.find(a => a.startsWith('--filter=')) || '').slice(9
 
 const kstr = (p, i) => (typeof p.consts[i] === 'string' ? p.consts[i] : null);
 
+// 符号名 → 字面量映射（由 resolve_symbols.js 生成）
+let SYMMAP = {};
+try { SYMMAP = JSON.parse(fs.readFileSync(path.join(__dirname, 'symbol_map.json'), 'utf8')); } catch (e) {}
+let viaSym = 0;
+
 // 只有真正写 R[A] 的指令才清符号；TEST/JMP/EQ/MMBIN/SETFIELD 等不写，清了会丢变量
 const WRITES_A = new Set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 19, 20,
   21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
@@ -127,6 +132,7 @@ function scan(p, caller, file) {
             } else if (nameReg && nameReg.kind === 'sym') {
               // 名字来自模块表字段，例如 Chapter.REQ_ENTER_LEVEL
               const key = nameReg.v;
+              if (SYMMAP[key]) { viaSym++; record(SYMMAP[key], params, caller, `${file}:${p.linedefined}`); clearAfter(A); break; }
               if (!symbolic.has(key)) symbolic.set(key, { params: new Set(), callers: new Set(), where: new Set() });
               const rec = symbolic.get(key);
               params.forEach(x => rec.params.add(x));
@@ -206,15 +212,25 @@ if (process.argv.includes('--md')) {
 }
 
 if (AS_JSON) {
-  console.log(JSON.stringify(rows.map(([name, r]) => ({
+  const out = rows.map(([name, r]) => ({
     api: name,
     params: [...r.params].sort(),
     callers: [...r.callers].sort(),
     where: [...r.where].sort(),
-  })), null, 2));
+  }));
+  for (const [name, r] of [...symbolic.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    out.push({
+      api: name, symbol: true,
+      params: [...r.params].sort(),
+      callers: [...r.callers].sort(),
+      where: [...r.where].sort(),
+    });
+  }
+  console.log(JSON.stringify(out, null, 2));
 } else {
   console.log(`扫描 ${parsed} 个函数文件（失败 ${failed}）；CallGS 调用点 ${sites} 个，`
-    + `解析出字面量 ${resolved} 个 → ${rows.length} 个接口；符号形式 ${symbolic.size} 个（名字在模块表里）\n`);
+    + `解析出字面量 ${resolved} 个 → ${rows.length} 个接口；`
+    + `符号还原 ${viaSym} 个，仍未还原 ${symbolic.size} 个\n`);
   const groups = new Map();
   for (const [name] of rows) {
     const g = name.includes('_') ? name.split('_')[0] : '(无前缀)';
