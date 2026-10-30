@@ -217,6 +217,31 @@ end
 
 local function tick()
   P.tickCount = P.tickCount + 1
+
+  -- 一次性：把 ShopLogic 上的数字/字符串常量全部打出来
+  -- 最需要的是 GID（属性组号）和 GoodsStart（每商品属性 id 的基址）
+  if not P.constDone then
+    P.constDone = true
+    pcall(function()
+      local sl = ShopLogic
+      if type(sl) ~= 'table' then lp('CONSTS no ShopLogic'); return end
+      local kv = {}
+      for k, v in pairs(sl) do
+        local t = type(v)
+        if t == 'number' or t == 'string' then
+          kv[#kv + 1] = tostring(k) .. '=' .. tostring(v)
+        end
+      end
+      table.sort(kv)
+      local buf = ''
+      for _, item in ipairs(kv) do
+        buf = buf .. ' ' .. item
+        if #buf > 200 then lp('CONSTS', buf); buf = '' end
+      end
+      if #buf > 0 then lp('CONSTS', buf) end
+      lp('CONSTS done n=', #kv)
+    end)
+  end
   local loaded = package and package.loaded or {}
   local total, hit, fresh = 0, 0, 0
   local names = {}
