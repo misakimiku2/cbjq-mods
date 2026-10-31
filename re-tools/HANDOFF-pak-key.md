@@ -107,6 +107,10 @@ node work/probe/parse_log.js  # 跑完游戏后解析 Game.log，hex 字节码�
 
 ## 六、注意
 
+- **2026-10-31 更新**：`snowbreak_extract.js` 的名字↔数据配对 bug 已修（旧版按顺序盲扫，
+  在名字区按目录分组的包里会张冠李戴；已改为结构化解析，文件名自带 entryRel 权威映射）。
+  用旧工具抽过的**文件名不可信**，数据本身没问题。正确配对下全部 uasset 都是标准
+  UE 包，无资产级加密。材质替换方案见 `work/HANDOFF-material-swap.md`
 - key 存在 `tools/.snowbreak-key`，**不要**加进 `sync_to_github.sh` 的两个发布仓库
 - 游戏已停更半年，key 不会轮换，但版本号变化仍要重新验证
 - 修改资源仍走 patch pak（这条路已验证可用），解包只是"看得见"

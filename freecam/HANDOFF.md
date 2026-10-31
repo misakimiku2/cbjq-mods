@@ -2,9 +2,721 @@
 
 > 需求：宿舍有拍照模式，但那是限定场景。要的是**游戏场景（战斗/关卡）里的自由镜头**，
 > 用于随意构图拍照。明确要求：不要和滚轮缩放 MOD（CamZoomMod）混在一起。
-> 状态：**v18 = ESC 退出 + 提示窗精装（嗅探器侧 overlay v2）**；碰撞为 v17 扫掠-滑移版；
-> v15 起与 CamZoomMod 合并成一个 pak（见「共存 —— 已实施」节）。
+> 状态：**v20 Lua + overlay v10（进程名根因已修，方向键应稳定可用）**。
+> pak 更新到 346,389 字节（Lua v21：暗角 PP 自检 + dofSync 6 帧）；
+> 嗅探器 v10：`GAME_PROCS` 补 `games.exe`。
+> 待验证：① 进相机 1.5s 内四角是否发暗（判断 PP 通道）② ↑↓ 跳行 / ←→ 改值
+> 是否稳定 ③ 光圈 1.4 画面是否变糊。
 > v13/v14 实测结论仍有效，交接快照见下方「当前状态快照」。
+
+---
+
+# ⏸ v26 结论：参数链全通，渲染端不消费 —— DOF 暂停，转查宿舍拍照模式
+
+**最后一版（v25 Volume）的日志**：
+
+```
+PPVOL spawned unbind=true                    ← Volume 创建成功
+DOF povFocal=0.0  povW=0.0                   ← POV 里没有 PP（相机组件路线已证伪）
+DOF vol=true  volFocal=800.0  volW=1.0       ← Volume 的 Settings 和权重都写对了
+```
+
+**Volume 也写对了，画面依然一点不糊。**
+
+## 所以问题定性
+
+不是「参数没传到位」——三条传递路径都已验证到位：
+
+| 路径 | 结果 |
+|---|---|
+| `UCameraComponent.PostProcessSettings` | 结构体写入成功，但 POV 里是空的（`povFocal=0`） |
+| `APlayerCameraManager.CameraCache.POV` | 被游戏覆盖，读回恒 0 |
+| 世界 `APostProcessVolume`（`bUnbound`） | 创建成功、`volFocal=800`、`volW=1`，**仍无效果** |
+
+**结论：`-FeatureLevelES31` + `r.MobileHDR:1` 的 UE4 Mobile 前向管线，
+在这套游戏里不实现景深后处理**，与参数无关。
+
+已排除的 cvar 组合（都设过、日志确认回显）：
+`r.DepthOfFieldQuality 2` / `r.DOF.Recombine.Quality 3` / `r.DOF.Gather.RingCount 7` /
+`r.DOF.Gather|Scatter.EnableBokehSettings 1` / `r.DOF.Scatter.MaxSpriteRatio 1.0` /
+`r.DOF.Kernel.Max{Foreground,Background}Radius 1.0` / `r.Mobile.ForceDepthResolve 1`。
+
+## 用户决定：暂停，去研究宿舍的拍照模式
+
+宿舍拍照模式有真实景深，说明引擎/项目里一定存在能出效果的实现。研究时值得确认：
+
+1. **相机 Actor 的类名** —— 之前 probe 记录过候选
+   `AFreeWatchModeCameraActor`（`EnableDebugCamera` / `SetFreeWatchCameraMode` /
+   `SetUniversalCameraMode` 都不在反射表里）。进拍照模式后用
+   `pc:GetViewTarget()` 打类名，和我们的 `CameraActor` 对比。
+2. **是否用了 Post Process Material** —— 移动端管线里 DOF 最常见的替代实现：
+   自定义材质 + `SceneDepth`，通过 `PostProcessSettings.WeightedBlendables` 挂上去。
+   如果是这种，我们也可以挂同一个材质（AssetPath 从 pak 里捞）。
+3. **是否切换了渲染管线 / FeatureLevel** —— 拍照模式若临时切 Deferred，
+   PC 的 DOF 参数就能用；可对比进拍照模式前后 `r.ForwardShading`、
+   `r.MobileHDR`、`r.DepthOfFieldQuality` 的回显。
+4. **是否有专用 cvar 前缀** —— `r.PhotoMode.*` / `r.Camera.*`。
+5. **是否假景深** —— 双层渲染 / 背景单独模糊，不经过后处理。
+
+## 当前保留状态
+
+- pak **361,169 字节**（v25，Volume 会在退出时销毁，对游戏无副作用）；
+  更早版本备份 `.bak-v20/.bak-v21/.bak-v22/.bak-v23`。
+- 嗅探器 **v11**（滑块常显、不闪、方向键可调、值变了立刻重绘）—— **这部分是好的，
+  只有「画面糊不糊」没解决**。
+- 用户研究出结果后继续。
+
+---
+
+# ★ v25：POV 诊断判定 —— 相机组件这条路从未生效，改走 PostProcessVolume
+
+**日志铁证（v24 加的那行）**：
+
+```
+[FreeCam] DOF apply fstop=2.80 focus=800 readback=2.7999999523163/800.0 w=1.0
+[FreeCam] DOF vtag=CameraActor_2147478260
+[FreeCam] DOF povFocal=0.0 povW=0.0          ← POV 里压根没有 PP
+```
+
+相机组件上 `readback` 完美、`BlendWeight=1.0`、ViewTarget 也确实是我们的
+CameraActor —— 但 `PlayerCameraManager.CameraCache.POV` 里的
+`PostProcessSettings.DepthOfFieldFocalDistance` 和 `PostProcessBlendWeight`
+**都是 0**。说明游戏的相机管理器**不把 CameraActor 的 PP 带进 POV**。
+
+**结论：v19 起的「写相机组件」路线从一开始就不可能生效**，
+之前所有 `readback=… 一致` 都只是「结构体自己写成功了」，和渲染无关。
+（也解释了为什么「暗角自检」看起来有效——那是移动端管线里别的因素造成的错觉。）
+
+## v25 改动：改用世界里的 APostProcessVolume
+
+`FSceneView` 的后处理来自 `WorldSettings->PostProcessVolumes`，**不经过 ViewTarget
+的 POV**，所以不受上面那条限制。
+
+- 新增 `setupDofVolume()`：spawn 一个 `APostProcessVolume`，`bUnbound=true`
+  （全屏生效，不依赖包围盒）、`BlendWeight=1.0`。
+- spawn 走 `UGameplayStatics.BeginDeferredActorSpawnFromClass` +
+  `FinishSpawningActor`（都是 BlueprintCallable，UnLua 能调）；
+  `UWorld::SpawnActor` 是 C++ 模板没暴露，只作兜底。
+- `applyDof` 抽出 `fillDof(st, blurR)`，**同时**写给相机组件和 Volume
+  （组件那条留着作对照，Volume 是主力）。
+- 退出时 `BlendWeight=0` + `DestroyActor`，不在游戏世界里留垃圾。
+- 新增日志：`PPVOL spawned unbind=…` / `PPVOL spawn failed`；
+  `applyDof` 增加 `DOF vol=… volFocal=… volW=…` 读回。
+
+pak **361,169 字节**已安装。
+
+## 下次判定
+
+| 日志 | 含义 | 下一步 |
+|---|---|---|
+| `PPVOL spawned` + 画面糊 | 成功 | 收工 |
+| `PPVOL spawn failed` | 反射接口不对 | 换 `UWorld::SpawnActor` 的其它重载 / 直接用场景现成 volume |
+| `PPVOL spawned` 但仍不糊 | 移动端管线连 Volume 的 DOF 也不实现 | 基本到引擎限制，考虑放弃 DOF 或改用后期材质 |
+
+---
+
+# ★ v24：画面不糊的根因 —— 游戏跑的是移动端（ES3.1）管线（2026-10-31 23:5x）
+
+**用户实测**：v11 滑轨正常了（UI 修复确认有效），但**画面依然完全不糊**。
+
+## 决定性证据：启动命令行
+
+```
+LogInit: Command Line: -FeatureLevelES31 -ChannelID=jinshan ...
+LogConfig: Setting CVar [[r.MobileHDR:1]]
+LogConfig: Setting CVar [[r.MobileMSAA:1]]
+LogConfig: Setting CVar [[r.Mobile.ForceDepthResolve:0]]
+```
+
+**`-FeatureLevelES31` 把引擎锁在 ES3.1 特性级别 → UE4 走 Mobile 前向渲染器**，
+不是 PC 的 Deferred。这解释了为什么「PP 能进、readback 全对、cvar 也设上了，
+就是不糊」：
+
+- PC 的物理景深（`DepthOfFieldFstop` + 焦平面换算）在移动端**基本不实现**；
+  移动端只认 `DepthOfFieldFocalDistance` / `DepthOfFieldDepthBlurRadius` /
+  `Near|FarTransitionRegion`（这几项我们已经在写，方向是对的）。
+- **`r.MobileMSAA:1` 下 scene depth 是 MSAA 目标，不 resolve 就读不到**，
+  而 `r.Mobile.ForceDepthResolve` 默认 **0** —— 移动端 DOF 拿不到深度，
+  参数再对也不会糊。这条是最可能的死结。
+
+## 本轮改动
+
+1. `r.Mobile.ForceDepthResolve 1`（加进 `dofCvars`，跟着每 10 秒一起补）。
+2. **POV 读回日志**：`DOF povFocal=<值> povW=<值>` —— 读
+   `PlayerCameraManager.CameraCache.POV.PostProcessSettings`
+   （相机组件上的 readback 只能证明结构体自身写成功，真正进渲染的是 POV）。
+
+pak **354,711 字节**已安装（备份 `.bak-v23`）。
+
+## 下次看日志怎么判
+
+| 日志 | 结论 | 下一步 |
+|---|---|---|
+| `povFocal=800` + 画面糊了 | 就是 ForceDepthResolve | 收工 |
+| `povFocal=800` 但仍不糊 | 移动端 DOF 被其它条件挡住 | 试 `r.MobileMSAA 0`，或改走 Volume |
+| `povFocal=0` / `nil` | PP 没进 POV | 改走世界 `APostProcessVolume` |
+
+---
+
+# ★ overlay v11：面板不刷新 —— ULW 的 psize 缓存是元凶（2026-10-31 22:2x）
+
+**用户实测**：「左右键调节时滑轨一点变化都没有；必须按 F9 关掉再打开，数值才刷新。
+上下选择也一样。」
+
+## 根因：`UpdateLayeredWindow` 在 psize / pptDst 同时为 NULL 时不重贴内容
+
+v6 为了防闪烁加了「窗口尺寸没变就传 NULL，只换内容」的缓存：
+
+```python
+psize = None
+if (win_w, win_h) != SZ['wh']:
+    SZ['wh'] = (win_w, win_h); psize = byref(size)
+UpdateLayeredWindow(hwnd, hdcScreen, None, psize, memdc, ...)
+```
+
+实机证明这会让新内容**贴不上去**：尺寸不变时 ULW 直接返回成功但画面不动。
+F9 之所以「能刷新」，是因为收起/展开改变了窗口尺寸 → 走的是另一条分支。
+`paints=` 计数也印证了：paint 一直在跑（72 次），是 ULW 没把结果贴上去。
+
+**修法**：每次都传 `psize`。传相同尺寸不会触发 resize，不会闪
+（v6 的闪烁真正来源是每 120ms 无条件 `ShowWindow`，那条早在 v6 就修掉了，
+尺寸缓存属于过度防御）。
+
+## 回归测试（已加进 `runtime/overlay_test.py`）
+
+截图前把 `DOF.fstop/focus` 改成 1.40 / 3333 并置脏，等 0.7s 再抓屏 ——
+`overlay_after_key.bmp` 里面板显示 **光圈 1.4 / 对焦 3333**、旋钮位置也变了。
+修复前这里会是旧值。
+
+## 另一件事：v23 的景深修复用户还没测到
+
+`Game.log` 最后写入 **22:06:48**，而 v23 pak（351,963 字节）是 **22:09** 才装的 ——
+用户 22:16 反馈「依然没效果」时，游戏里跑的还是 v22。**需要重启游戏**才能验证
+`r.DOF.Recombine.Quality 3` 那一组改动。
+
+---
+
+# ★ v22：暗角自检给出答案 —— PP 通道通，问题在 DOF 本身（2026-10-31 20:3x）
+
+**实测**：进相机能看到四角暗角 ⇒ `CameraComponent.PostProcessSettings` **确实进了
+渲染管线**。所以 v19/v20 怀疑的「PP 没被采用」不成立，问题收敛到「DOF 参数/开关」。
+
+## 三个最可能的压制点，本轮全部处理
+
+1. **`r.DepthOfFieldQuality` 运行时被压 0**（最可能）。启动日志是 `:2`，但手游改端
+   常在 gameplay 里关掉整套景深。现在进相机强制 `r.DepthOfFieldQuality 2`，
+   并用 `ExecuteConsoleCommand('r.DepthOfFieldQuality')` 把**运行时实际值**打到日志
+   （`DOF quality=`），下一次就能确认它到底是不是 0。
+2. **cvar 被周期重置**：切场景/进战斗可能把 `r.DOF.Kernel.Max*Radius` 打回 0.025。
+   现在每 300 帧（5s）补一次。
+3. **物理光圈路径不生效**：加了「深度模糊」兜底 ——
+   `DepthOfFieldDepthBlurRadius` 直接给模糊半径，不经过 Fstop 换算；
+   强度跟 `fstop` 联动（1.4 → 1.0 最糊，16 → 0 最清晰），保证滑块每一格都有反馈。
+   同时补 `DepthOfFieldDepthBlurAmount=1.0` / `MinFstop=1.0`。
+4. `r.DOF.Gather.RingCount 4`（原默认可能 1，模糊会碎成块）。
+
+pak **350,671 字节**已安装；备份 `.bak-v20` / `.bak-v21`。
+
+## 下一次验证要看的日志
+
+```
+[FreeCam] DOF quality=2          ← 运行时质量，若是 0 就说明被压了（但我们也设了 2）
+[FreeCam] DOF apply fstop=.. focus=.. readback=.. w=..
+[FreeCam] DOF vtag=<ViewTarget 名>
+[FreeCam] DOF sync f=.. d=.. rb=.. rbVig=..
+```
+
+如果 `quality=2` 且 `readback` 正确、画面仍然不糊 —— 那就是游戏在
+PlayerCameraManager 之后有自己的后处理覆盖，下一步改走世界 `APostProcessVolume`。
+
+---
+
+# ★ v10：找到贯穿 v6~v9 的真正根因 —— 进程名不匹配（2026-10-31 20:3x）
+
+**用户实测**：方向键偶尔能改值（`dof.txt` 变成 `3.00 3800`），但大多数时候没反应；
+按 F9 之后「左右似乎能调」（其实是面板收起后方向键漏给游戏、镜头在转）；
+UI 之前还自己消失过两次。
+
+## 根因：`GAME_PROCS` 里没有 `games.exe`
+
+```
+GAME_PROCS = ('game.exe', 'game-win64-shipping.exe')      # 旧
+tasklist 实际: Games.exe   32232   Console   559 MB       # 游戏本体
+```
+
+`refresh_pids()` 按映像名精确匹配 → `_game_pids` **永远是空** →
+`game_running()` 恒 False。连锁后果：
+
+| 位置 | 后果 |
+|---|---|
+| `sniffer_state.txt` | `game_pids=[]` 一直为空（早就写着，一直没被当回事） |
+| overlay 显隐 | 每 2s 把 `on` 置 0 → **UI 自己消失**；再进相机又出现 |
+| `_ovl_on[0]` | 大部分时间是 0 |
+| v6/v7 悬停交互 | `hover` 依赖 `prev_on` → 永远 False → 窗口不摘穿透 → **点击全漏** |
+| v8 钩子转发 | `_ovl_on=0` → **不转发** → 点击还是漏 |
+| v9 方向键 | `_ovl_on=0` → **不拦截** → 按键漏给游戏（镜头转，误以为在调） |
+
+**一条进程名，毁了四版交互。** 之前 v6~v8 一直在「窗口/坐标/样式」上找原因，
+方向全错。
+
+## 修复
+
+1. `GAME_PROCS = ('game.exe', 'games.exe', 'game-win64-shipping.exe')`。
+   ⚠ 换游戏版本时先用 `tasklist` 核一遍映像名。
+2. overlay 的隐藏判定放宽：`game_running() or _launcher_pids` 就认为游戏还在，
+   宽限 5s；真退了由 `tick()` 连续 3 拍兜底清 `freecam_on.txt`。
+   这样即使以后再遇到映像名变化，也不会再把 UI 弄消失。
+
+## 附带：DOF 为什么始终不生效（本轮加诊断）
+
+日志证据：进入相机只有一条 `DOF apply fstop=2.80 focus=800 readback=… w=1.0`，
+且 `r.DOF.Kernel.Max*Radius = "1"`、启动时 `r.DepthOfFieldQuality:2` —— **参数全对**，
+但画面就是不糊。说明「写进 CameraComponent 的 PostProcessSettings」**可能根本没进
+渲染管线**，而 readback 只能证明结构体写成功，证明不了被采用。
+
+新增自检（Lua v21）：
+- 进相机后 **前 1.5 秒给一档暗角**（`VignetteIntensity = 1.5`），之后自动归 0。
+  **看得见四角发暗 = PP 通路没问题**，问题只在 DOF 参数；
+  **看不见 = 整套 PostProcessSettings 白写**，得改走世界的 `APostProcessVolume`。
+- 日志加 `DOF vtag=<ViewTarget 显示名>`（确认游戏相机管理器用的是我们 spawn 的
+  CameraActor）与每次值变化的 `DOF sync f=.. d=.. rb=.. rbVig=..`（限流 20 条）。
+- `cfg.dofSync` 20 → **6 帧**：60fps 下原来有 0.33s 滞后，按方向键手感发滞。
+- pak 更新：**346,389 字节**已安装；旧版备份 `Patch_CamZoomMod-Windows_100_P.pak.bak-v20`。
+
+## 待验证（顺序不能乱）
+
+1. **关游戏** → 关启动器 → 重开桌面启动器（加载 v10 嗅探器，进程名修复在这里）；
+2. 开游戏（加载新 pak）→ B 进相机；
+3. **先看暗角**：进相机后 1.5 秒内四角应明显发暗 → 记下「有 / 没有」；
+4. 按 ↑↓ 看蓝底跳行、按 ←→ 看数值变（这次应该稳定，不再时灵时不灵）；
+5. 把光圈调到 1.4 看画面是否变糊；若暗角有、糊没有 → 我再改走 PostProcessVolume。
+
+---
+
+# ★ overlay v9：方向盘调参，彻底放弃鼠标（2026-10-31 20:1x，离线已验证）
+
+**用户决定**：鼠标拖拽三次实机都点不通，不再折腾这条路，**改用方向键**：
+↑↓ 选参数、←→ 调数值。
+
+## 改动
+
+1. **删除全部鼠标交互**：分层窗口永久 `WS_EX_TRANSPARENT`，`wndproc` 不再处理
+   `WM_LBUTTONDOWN/MOUSEMOVE/LBUTTONUP`，钩子里的 `PostMessage` 转发整段删除，
+   `_ovl_rect / _ovl_drag / _ovl_hwnd / LASTFWD / dof_set_from_x` 全部清掉。
+   鼠标点击恢复为完全穿透（不再误吞面板区域的点击）。
+2. **方向键在钩子里直接拦**（`_key_proc`）：
+   ```python
+   if vk in _DIRKEYS and _ovl_on[0] and DOF['show']:
+       adj_dof(vk); return 1        # 游戏收不到
+   ```
+   - 只在「拍照模式 + 面板展开」时拦；否则方向键原样给游戏（菜单照常用）。
+   - KEYUP 也一起吞，避免游戏收到孤立的抬起。
+   - **不进 `KEYS_OF_INTEREST`、不写 `fp_key.txt`、不进 blockList** ——
+     所以不用改 Lua / 重打 pak。
+3. **钩子里零 IO**：`adj_dof()` 只改内存 + 置 `dirty`；落盘（`dof.txt`）和重绘
+   统一挪到 overlay 线程的 80ms 循环里。低级钩子里做文件 IO 有
+   `LowLevelHooksTimeout` 风险。
+4. `DOF['edit']` / `DOF['drag']` 概念取消：方向键不占用 WASD，**调滑块不再冻结
+   相机走位**，`dof.txt` 第 3 字段恒 0。
+5. 提示改为常驻两行：`↑↓ 选参数    ←→ 调数值` / `F9 收起面板`；版本 **v9**。
+
+## 验证：`runtime/dof_key_test.py`（新增）
+
+构造 `KBDLLHOOKSTRUCT` 直接调 `_key_proc`（与真实钩子同一函数），实测：
+
+```
+down x1 ret=1 -> sel=1        down x1 ret=1 -> sel=0        up x1 ret=1 -> sel=1
+right x3 ret=1 -> 3.40 (was 2.80)      left x1 ret=1 -> 3.20
+left x100 (clamp) -> 1.40 (下限)       right x200 (clamp) -> 8000 (上限)
+dof.txt = 1.40 8000 0
+state   = sel=1 fstop=1.40 focus=8000 last=vk=39 ...
+```
+
+`ret=1` 证明按键被吞（游戏收不到），clamp 生效，且 overlay 线程把值落盘。
+
+## 键位对照
+
+| 键 | 作用 |
+|---|---|
+| ↑ / ↓ | 切换参数行（光圈 ↔ 对焦） |
+| ← / → | 当前行减 / 加一档（光圈 0.2，对焦 120） |
+| 按住 | 系统 repeat，连续微调 |
+| F9 | 收起 / 展开面板（收起后方向键还给游戏） |
+
+## 待验证
+
+进相机 → 直接按 ↑↓ 看蓝底在「光圈/对焦」之间跳 → 按 ←→ 看数值变、画面景深变。
+若数值不变，看 `overlay_state.txt` 的 `last=` 是否为 `-`（说明按键没进钩子）。
+
+---
+
+# ★ overlay v8：点击改走钩子转发（2026-10-31 20:3x，实机仍失败，已被 v9 取代）
+
+**v7 实机反馈**：仍然点不动；调试中 UI 自己消失了两次又出现。
+
+## 取证：诊断文件说明点击**从未到达窗口**
+
+`overlay_state.txt`：`click=-`（wndproc 一次 `WM_LBUTTONDOWN` 都没收到），
+而 `dof.txt` 已变成 `3.80 680`（说明键盘那侧有时是通的）。
+`fp_key_raw.txt` 里 `mouse=LMBdown blk=[]` —— **黑名单是空的**，钩子既不吞也不放行，
+点击直接透传，窗口却收不到 ⇒ 窗口一直是 `WS_EX_TRANSPARENT`。
+
+## 根因：v6/v7 的「切样式」方案依赖轮询猜悬停，注定不可靠
+
+`hover` 是每 80ms 用 `GetCursorPos` 轮询一次再和 `_ovl_rect` 比 —— 这条链上有
+DPI 口径、多屏、tick 时机三重不确定性，任一处对不上就永远 hover=0：
+窗口保持穿透 → 点击漏给游戏 → `click=-`。**这不是参数调错，是方案本身错。**
+
+## v8 改法：窗口永久穿透，钩子把事件 PostMessage 转发进窗口
+
+```
+系统鼠标事件 → WH_MOUSE_LL(_mouse_proc 手里就有真实屏幕坐标)
+   ├─ 光标落在 _ovl_rect 内 且 左键 → PostMessage(窗口, 客户区坐标) + return 1（吞掉）
+   └─ 光标在面板外 → 原样放行
+```
+
+- **不再切 `WS_EX_TRANSPARENT`**（窗口创建时就带，永不摘除），彻底没有竞态。
+- 事件驱动、坐标来自钩子本身，不猜。
+- 拖拽：`LBUTTONDOWN` 命中面板 → `_ovl_drag[0]=1`；`MOUSEMOVE` 只在拖拽中转发
+  （高频事件平时不转发不吞）；`LBUTTONUP` 无论光标是否甩出面板都转发并清状态。
+- `edit`（冻结走位 + 键盘调节）简化为 `ALT 按住 or 正在拖拽`。
+- **顺手修了个会让钩子抛异常的真 bug**：`WM_MOUSEMOVE` 常量在模块里没定义
+  （`hook_fwd_test.py` 一跑就 `NameError`），而它在 `if` 条件里、不在 `try` 内，
+  真实环境会直接打断钩子回调。
+
+## 顺带修「UI 自己消失」
+
+`game_running()` 依赖 1s 一次的 pid 快照，偶发一拍看不到游戏就会：
+- overlay 立刻 `on=False` 隐藏 → 用户看到「消失」；
+- `tick()` 把 `freecam_on.txt` 清 0 → 更久消失。
+
+现在两处都加宽限：overlay 侧最近 2s 内见过游戏就不隐藏；`tick()` 连续 3 拍
+（3s）确认不在才清文件。
+
+## 验证：`runtime/hook_fwd_test.py`（新增，离线全链路）
+
+跳过装钩子（不需要游戏），直接构造 `MSLLHOOKSTRUCT` 调 `_mouse_proc`，实测：
+
+```
+in-fstop  hook_ret=1 fwd=LMB 150,322   state: click=120,322 HIT fstop
+in-focus  hook_ret=1 fwd=LMB 150,348   state: click=120,348 HIT focus
+outside   hook_ret=0                   state: click 不变（没转发）
+```
+
+面板内返回 1（吞掉）、坐标换算正确（150 物理 / 1.25 = 120 逻辑命中）、
+面板外返回 0 放行 —— 与真实钩子回调走的是同一个函数。
+
+## 待用户验证
+
+1. 重启启动器 → 进相机；
+2. 鼠标移到「光圈」滑块上按住左键横拖 → 数值应变、画面景深应实时变；
+3. 拖的时候**相机应停住**（`edit=1` 冻结走位），松手后鼠标移开面板 W 能走；
+4. 若仍无反应，看 `overlay_state.txt`：
+   - `fwd=-` → 钩子没转发（`_ovl_on`/`_ovl_hwnd` 没置上）
+   - `fwd` 有值但 `click=-` → PostMessage 到了但 wndproc 没处理
+
+---
+
+# ★ overlay v7：交互入口修正（2026-10-31 20:2x，实机失败，被 v8 取代）
+
+**用户 v6 实机反馈**：版本标记确认是 v6、面板常显正常，但**鼠标和键盘都调不动**。
+
+## 根因判断：v6 把 ALT 当成了唯一入口，而这个前提用户根本不知道
+
+v6 的 `DOF['edit']` 用 `alt and show and prev_on` 三重门控，**同时**控制了：
+窗口去 `WS_EX_TRANSPARENT`（能不能收到点击）、键盘 W/S/A/D 调节、写 `dof.txt` 的
+`edit=1`（冻结走位）。而提示文案只写了「W/S 选行 A/D 调节」，**没写要按 ALT**；
+「按住 ALT · 可拖动」这句又只在 edit=1 时才显示 —— 鸡生蛋，用户永远看不到。
+
+一旦 ALT 判定不成立（没按 / GetAsyncKeyState 读不到），**鼠标点击被钩子吞掉、
+键盘分支也不执行，两个入口一起死**，完全复现用户症状。
+
+## v7 改法：交互入口与「冻结走位」解耦
+
+| 判定 | 条件 | 作用 |
+|---|---|---|
+| 窗口可交互 | `prev_on and (hover or alt or drag)` | 去 `WS_EX_TRANSPARENT`，点击能进 wndproc |
+| `edit`（冻结走位 + 键盘调节） | `prev_on and show and (hover or alt or drag)` | 写 `dof.txt` 第 3 字段 |
+
+- **hover = 光标落在 `_ovl_rect` 内**，80ms 一查。鼠标移到面板上就能拖，不需要按
+  任何键；拖拽期间 `drag` 条件兜底，甩出面板也不会丢 `LBUTTONUP`。
+- 钩子放行条件同步改成「`_ovl_on[0]` 且光标在面板内（或 `_ovl_drag[0]`）」，
+  **不再要求 ALT** —— 否则点击照样被吞，窗口收不到 `WM_LBUTTONDOWN`。
+- 鼠标移开面板 → `edit` 自动归零，WASD 立刻还给相机（面板不再抢走位键）。
+- 顺带修 `WM_LBUTTONDOWN` 坐标：`lp & 0xFFFF` 是有符号 16 位，拖出窗口左侧会
+  变成 6 万多 → 滑块跳到最右。改 `ctypes.c_short(...).value`。
+- 提示改成两行常驻：`悬停面板可拖动 · ALT 锁视角` / `W/S 选行 · A/D 调节 · F9 收起`。
+  版本标记 **v7**。
+
+## 新增诊断：`C:\ProgramData\CamZoomMod\overlay_state.txt`（400ms 覆写）
+
+```
+t=2510.4 on=1 alt=0 hover=1 edit=1 exm=1 drag=- hit=2 click=118,352 HIT fstop
+```
+
+判读表（一次复现就能定位，不用再猜）：
+
+| 现象 | 结论 |
+|---|---|
+| `hover=0` 且鼠标明明在面板上 | `_ovl_rect` 与光标坐标口径不一致（DPI） |
+| `click=-` | 点击压根没到窗口 → 钩子吞了 / 样式没去透明 |
+| `click=… MISS of 2` | 到了窗口但没命中滑块行 → HIT 布局/坐标换算问题 |
+| `click=… HIT fstop` 但画面无变化 | 问题在 Lua 侧（`dof.txt` 没读 / DOF 没进 POV） |
+
+## 待验证
+
+1. 重启启动器（Python 改动，pak 不用动）→ 进相机；
+2. **鼠标直接移到滑块上拖**（不用按 ALT）→ 数值应实时变、相机应自动停住走位；
+3. 鼠标移开面板 → W 应立刻能推相机；
+4. 拖完看 `overlay_state.txt`：`click` 一栏应出现 `HIT fstop` / `HIT focus`。
+
+---
+
+# ★ overlay v6：滑块常显 + 修周期性闪烁（2026-10-31 20:0x，代码在盘待实机）
+
+**用户 v20 实测三条反馈**：① 滑块要按 F9 才出现且会消失，要求**常显**；
+② **UI 周期性闪烁**（频率不高）；③ DOF 是否出效果未知。
+
+## 1) 滑块常显：`show` 与 `edit` 解耦（这是关键设计）
+
+问题不只是「按 F9 才出现」——旧代码 `DOF['on']` 一个变量同时管三件事：
+面板绘制、ALT 可拖拽、写进 dof.txt 的 `edit`（= 冻结相机走位）。
+**面板一常显就等于 WASD 永远被滑块吃掉，相机走不动。**
+
+v6 拆成两个状态：
+
+| 字段 | 含义 | 驱动 |
+|---|---|---|
+| `DOF['show']` | 是否绘制面板 | 默认 **True**；F9 仅作「收起/展开」，进拍照模式自动恢复 True |
+| `DOF['edit']` | 交互态 = 冻结走位 + 可拖拽 | **ALT 按住**（游戏本来就用它呼出鼠标指针），松开立刻把 WASD 还给相机 |
+
+- `dof.txt` 第 3 字段现在写 `edit`（ALT），不再写 panel 开关。
+- 退出拍照模式时 `edit` 强制归零并**只写盘一次**，避免相机走位被永久锁死。
+- 编辑态时标题「景深」转亮蓝、右侧出现「按住 ALT · 可拖动」，给即时反馈。
+- 底部提示文案改为 `W/S 选行    A/D 调节    F9 收起`；版本标记 **v6**。
+
+## 2) 周期性闪烁：两处根因，都在「无条件重复调用」
+
+1. **每 120ms 无条件 `ShowWindow(SW_SHOWNA)`**（旧 L1190）。对已显示的**分层**
+   窗口反复 show 会让 DWM 重新合成 —— 8.3Hz，正是用户描述的「频率不高」。
+   → 现在 `prev_on` 记录可见状态，**只在状态真变化时**调一次。
+2. **每次 `UpdateLayeredWindow` 都带 `psize`**。尺寸参数就算没变，也会让分层窗口
+   走「调整尺寸」路径（卸表面重贴）。→ 加 `SZ['wh']` 缓存，尺寸没变传 `NULL`。
+
+附带：`SetWindowPos(SWP_FRAMECHANGED)` 只在 ALT 状态切换时执行（本来就有条件），
+不再每拍触发整窗重算。
+
+## 3) 定时器：单 80ms + 时间戳节流
+
+试过拆成 991(80ms)/992(400ms) 两个 `SetTimer` 分频，**`msg.wParam` 分支在实测里
+不触发**（overlay_test 里窗口一直不显示）→ 改回单定时器 991/80ms，显隐用
+`now >= next_vis` 节流到 400ms。逻辑更直白，也不依赖 wParam 语义。
+
+## 4) DOF 到底生不生效 —— 日志取证：**三项配置全部到位**
+
+从 `E:\SeasunCBJQos\Game\cbjq\game\Saved\Logs\Game.log`（19:36-19:37 那次 v20 实测）：
+
+- `[FreeCam] DOF apply fstop=2.80 focus=800 readback=2.7999999523163/800.0 w=1.0`
+  → ① FPostProcessSettings 写穿成功 ② `PostProcessBlendWeight = 1.0`
+- `r.DOF.Kernel.MaxForegroundRadius = "1"` / `MaxBackgroundRadius = "1"`
+  → 进入相机时 cvar **确实改成 1.0**（游戏默认 0.025 已解除）
+- 退出时两行还原为 `0.025` ✓
+- 启动日志 `r.DepthOfFieldQuality:2` → 高质量 DOF 管线**是开着的**，不会跳过
+
+**结论**：能配的都配上了，参数不是瓶颈。若实机调到 Fstop 1.4 仍然一点不糊，
+只剩一种可能 —— **ACameraActor 的 POV PostProcessSettings 没被游戏相机管理器采用**。
+下一轮若仍无效果，按序加诊断（都要重打 pak）：
+1. 进相机时打 `pc:GetViewTarget()` 的类名，确认 ViewTarget 真是我们的 CameraActor；
+2. 打 `pc.PlayerCameraManager` 当前 `CameraCache`/`PendingViewTarget`；
+3. 备选路径：世界 `UPostProcessVolume`（`bUnbound=true` + `BlendWeight=1`），
+   它走 `WorldSettings→PostProcessVolumes` 收集，不依赖 ViewTarget POV。
+
+## 5) 验证（offline，已通过）
+
+`runtime/overlay_test.py` 本轮加了两处修正：
+- 铺一张 `SS_WHITERECT` 纯白 STATIC 背景（真实桌面/游戏画面是**动态**的，
+  两次抓屏之间它自己会变 → 原来全屏 diff 会得到「全屏都不同」的假结果）；
+- diff **只在窗口矩形内统计**，并打印窗口矩形。
+- 等 `IsWindowVisible` 轮询确认可见（显隐走 400ms 节流，原来 0.4s 正好踩边界）。
+
+实测：`rect = 48 48 313 428`（265×380，面板常显不再伸缩）、
+`diff bbox = (48,48,312,427)` 与窗口矩形**完全吻合**、BMP 确认六行键位 + 景深面板
+（光圈 5.6 / 对焦 1200 双滑块）+ 底部提示完整无裁切。
+
+## 6) 待用户实机复验（本轮只改了嗅探器 Python，pak 不用重装）
+
+1. 点桌面「尘白禁区-本地服」（一次 UAC）→ `sniffer_state.txt` 应有
+   `hooks=on elevated=1`；
+2. 进游戏按 **B** 进自由相机 → **UI 一进来就有滑块面板**（无需 F9），
+   且**不再周期性闪烁**（盯 30s 确认）；
+3. **按住 ALT**：标题「景深」变亮蓝 + 右侧出现「按住 ALT · 可拖动」→ 拖动滑块，
+   画面景深应实时变化；松开 ALT 后 **WASD 应立刻能走相机**（这是本轮改动的核心，
+   务必验：常显面板不能抢走走位键）；
+4. 调到光圈 **1.4** 看是否明显模糊；若完全无变化，把 `Game.log` 里
+   `[FreeCam] DOF` / `r.DOF.Kernel` 行发我，按上面第 4 条加诊断；
+5. 退出拍照模式 → 面板消失；再进 → 面板自动回来；F9 可收起（可选）。
+
+---
+
+# ★ v20 实测结果 + 下轮任务（2026-10-31 19:37 记录 —— 三项已由上方 overlay v6 处理）
+
+**本轮已交付（代码在盘上，未再改动）**：
+- pak v20 = 341,393 字节已安装（Lua v20）；嗅探器 overlay v5（runtime/wheel_sniffer.py）。
+- Lua v20：景深改 `CameraComponent.PostProcessSettings` + `PostProcessBlendWeight=1`；
+  进相机 `ExecuteConsoleCommand` 把 `r.DOF.Kernel.MaxForegroundRadius/MaxBackgroundRadius`
+  提到 1.0，退出还原 0.025；日志 `DOF apply ... readback=... w=`。
+- 嗅探器 v5：ALT+面板打开时去 `WS_EX_TRANSPARENT` 变可交互；钩子对「ALT+光标在
+  面板矩形内（`_ovl_rect`）」的左/右键放行；WM_LBUTTONDOWN 命中 HIT 行 → 按 x 反算
+  值写 dof.txt + 节流重绘（80ms）。降采样换 GDI StretchBlt(HALFTONE) DIB→DIB
+  （2x 画布 = CreateDIBSection + GDI 经 GdipCreateFromHDC 画入；~30ms/帧）。
+
+**实测反馈（用户 19:37 报告）**：
+1. **滑块消失**：面板要按 F9 才出现，且出现后消失 —— 用户明确要求
+   **滑块必须常显在 UI 上**，不要 F9 专门面板。
+2. **UI 周期性闪烁**（频率不高）。
+3. DOF 是否出效果**未知**（本轮用户没提模糊，很可能没来得及验证或仍未生效）。
+
+**下轮任务（按序）**：
+1. **滑块常显**：去掉 F9 门控 —— `paint()` 无条件绘制景深面板（DOF['on'] 语义改为
+   「面板常驻」，可保留 F9 作为可选显隐但默认开）。窗口高度固定 ~430，不再伸缩。
+2. **修闪烁**（已定位嫌疑，未动手）：`wheel_sniffer.py` L1190
+   `u.ShowWindow(hwnd[0], 8 if on else 0)` **每 120ms 无条件调用** —— SW_SHOWNA 反复
+   作用于已显示层窗口会触发重排/重合成闪烁。修法：记录 `_vis` 状态，仅在变化时
+   调用；同理 ULW 尺寸未变时不重设。可再把定时器拆成「显隐 500ms + 交互 80ms」。
+3. **验证 DOF 是否生效**：日志 grep `DOF apply`（`w=` 应为 1.0）与进入相机时的
+   `r.DOF.Kernel.MaxForegroundRadius 1.0` LogConfig 行。若 cvar 没生效：考虑直接在
+   `DefaultEngine.ini`？不可（游戏 pak 只读）—— 备选 `ExecuteConsoleCommand` 换
+   `K2_ExecuteConsoleCommand`（PlayerController 上的同名 UFUNCTION）或
+   `APlayerController::ConsoleCommand`。若 PP 仍不生效：查 ViewTarget 是否真是我们的
+   CameraActor（`pc:GetViewTarget()`），必要时改用世界里的 UPostProcessVolume。
+4. 顺带：ALT 拖拽需实机确认（本轮未验证到）。
+
+---
+
+# ★ v20 景深修正 + ALT 鼠标拖拽（2026-10-31，待实机验证）
+
+**v19 实机结果：完全无效果。根因（日志取证）**：
+1. v19 挂 `UPostProcessComponent` 能写进 Settings（`readback=2.8/800` 一致），但游戏
+   相机管理器不收集 ViewTarget 上的 PP 组件 → 画面无变化。
+2. **游戏启动时把 DOF 核半径钳死**：日志 `LogConfig: Setting CVar
+   r.DOF.Kernel.MaxForegroundRadius:0.025` / `MaxBackgroundRadius:0.025` ——
+   0.025 的模糊核肉眼不可见。（当初 grep `r.DepthOfField*` 漏了 `r.DOF.*` 前缀。）
+
+**v20 修法**：
+- 景深改走 **CameraComponent.PostProcessSettings + PostProcessBlendWeight=1**
+  （GetCameraView 会把相机组件的 PP 带进 POV，标准照片模式路径）。
+- 进相机时 `ExecuteConsoleCommand` 把 `r.DOF.Kernel.MaxForegroundRadius/
+  MaxBackgroundRadius` 提到 **1.0**，退出还原 **0.025**（游戏默认值，日志实证）。
+- 日志保留 `DOF apply ... readback=.../... w=...`（w=PostProcessBlendWeight）。
+
+**ALT + 鼠标拖拽（嗅探器 overlay v5）**：
+- 游戏里**按住 ALT 会呼出鼠标指针** —— 借此做拖拽：ALT 按住且景深面板打开时，
+  overlay 去掉 `WS_EX_TRANSPARENT` 变可交互；钩子对「ALT + 光标在面板矩形内」的
+  左/右键**放行**（`_ovl_rect` 全局由 paint 更新），面板外照常吞掉防误触。
+- 拖动滑块：WM_LBUTTONDOWN 命中行（paint 时记录 HIT 逻辑矩形）→ 按鼠标 x 反算
+  值（光圈对数刻度/对焦线性）→ 写 dof.txt + 立即重绘（移动节流 80ms）。
+- **降采样改 GDI StretchBlt(HALFTONE)，DIB→DIB**：v19 的纯 Python 盒滤波 0.4s/帧
+  拖不动滑块；GDI+ DrawImage 本机 AV（探针 6）；GdipGetDC 交叉读不可靠（实测空帧）。
+  现在 2x 画布本身是 CreateDIBSection，GDI+ 用 GdipCreateFromHDC 画进去，
+  StretchBlt 拉伸到窗口 DIB —— 全程 GDI 表面，~30ms/帧，拖动流畅。
+- 键盘 W/S 选行 + A/D 调节保留作备用。版本标记 v4 → **v5**。
+
+**待实机验证**：B 进相机 → F9 → 按住 ALT 呼出鼠标 → 拖动光圈/对焦 → 画面景深应
+实时变化（光圈越小越糊）；松开 ALT 恢复穿透。若仍无效果：看日志
+`DOF apply ... w=` 的 w 是否 1，以及进相机时有没有 `r.DOF.Kernel.*Radius 1.0` 的
+LogConfig 行。
+
+---
+
+# ★ v19 景深模糊（F9 面板）—— 实机无效果，被 v20 取代（2026-10-31）
+
+**需求**：滑块选项调整景深模糊。
+
+**方案（侦查结论落地）**：Game.exe 无 r.DepthOfField* cvar（shipping 裁掉），DOF 全是
+**FPostProcessSettings 反射属性**（DepthOfFieldFstop / FocalDistance /
+Near/FarTransitionRegion + bOverride_*）。APlayerCameraManager 会收集 ViewTarget
+（= 自由相机 Actor）上的 **UPostProcessComponent** 并应用 —— 所以：
+
+- **Lua v19**：进入相机时 `UE4.NewObject(UPostProcessComponent, camActor)` +
+  RegisterComponent，写 `Settings.bOverride_DepthOfFieldFstop/FocalDistance/
+  Near-FarTransitionRegion = true` + 值，`BlendWeight=1`、`bUnbound=true`；
+  每 20 帧读 `dof.txt`（`"fstop focus edit"`）同步；`edit=1` 时冻结相机走位
+  （WASD 让给滑块）；进入时日志 `DOF apply fstop=... readback=...`，若 readback
+  与期望不符说明 UnLua 链式 struct 写穿不生效（已加 `c.Settings = st` 兜底回写）。
+- **嗅探器（overlay v4）**：**F9** 开关「景深 · F9」面板；**W/S** 选行、**A/D**
+  调节（按住连续，120ms 定时器）；参数写 dof.txt。panel 高亮选中行、轨道+白色
+  填充+圆形旋钮+数值。版本标记 v3 → **v4**（截图自证）。
+- 键位：F9(120) 加进 KEYS_OF_INTEREST + Lua blockList；F9 由嗅探器内部消费，
+  游戏收不到。面板打开时 dof.txt edit=1，Lua 冻结相机走位。
+- **滑块用键控不做鼠标拖拽**：游戏鼠标走 Raw Input，拖拽会和镜头旋转打架；
+  键控（W/S/A/D 按住连续调）稳定且不需要改钩子放行逻辑。
+
+**待实机验证**：B 进相机 → F9 打开面板 → 调光圈（1.4~16，越小越糊）/对焦
+（100~8000cm）→ 画面景深应实时变化；调参时相机不应走动（edit=1 冻结）；
+F9 关闭 → WASD 恢复；日志确认 `DOF apply ... readback=` 的 readback 与实际一致。
+若画面无任何模糊：看日志是 `DOF no UPostProcessComponent class`（类不可见）还是
+readback 不符（写穿失败，需换 UnLua 内联 struct 写法）。
+
+---
+
+# ★ overlay v3：防锯齿 + 生命周期绑定（2026-10-31，已验证）
+
+**用户反馈三件事**：① 字体/按钮锯齿多 ② Alt+F4 强退游戏后 UI 残留屏幕 ③ 嗅探器
+别占额外程序/UAC，绑定到本地服启动器生命周期。另：下一轮做景深模糊滑块（见末节）。
+
+**① 防锯齿（wheel_sniffer.py overlay v3）**
+- main() 开头声明 DPI 感知（PerMonitorV2，回退 SetProcessDPIAware）——不分层窗口
+  会被 DWM 按虚拟化坐标拉伸。
+- **2x 超采样 + 2x2 盒滤波降采样**：绘制坐标 ×K 落到 (2W1,2H1) 位图，画完纯 Python
+  盒滤波（0x00FF00FF 双通道打包技巧，224K 次标量循环 ~0.5s）回物理尺寸。
+- ⚠ **本机 gdiplus.dll 的 `GdipDrawImageRectRect` 原生 AV（探针 6）**——降采样只能
+  纯 Python，GDI+ 只画不缩。
+- ⚠ **键帽宽度不再做字体测宽，按内容硬编码**（`estw`：CJK 15px/字、ASCII 8px/字；
+  `draw_cap`：单字母 36、ESC 44、双汉字 50）。原因（实机三连击）：GdipMeasureString
+  本机不可用；GDI GetTextExtentPoint32W 与 GDI+ DrawString 的 em 口径不一致；最终
+  发现**盒滤波源索引写错**（`base + dx` 应为 `base + 2*dx`）—— 等于把 2x 大图原尺寸
+  塞进 1x 位图，全部内容撑大 2 倍、右侧被窗口裁掉（「挤压 + 显示不全」的真正元凶）。
+  布局与绘制同源（draw_cap 返回宽度给布局用），窗口宽度由布局推出，保证装得下。
+- **标题旁有半透明 `v3` 版本标记**：以后看截图即可确认跑的是哪版 overlay。
+- overlay_test.py 实跑验证：窗口 265×278；BMP 像素级测量 —— 键帽 36 宽、间距 43、
+  右边界 230 全部在窗口内；六行完整（含 ESC 行）。
+
+**② 游戏退出 → UI 消失**
+- overlay 定时器可见条件追加 `game_running()`：游戏一死立即隐藏（300ms 内）。
+- tick() 检测游戏不在 + freecam_on.txt=='1' → 清写 '0'（Lua 强退没机会写的残留）。
+
+**③ 启动器绑定（launcher.py + wheel_sniffer.py --launcher-pid）**
+- launcher.py：main() 服务启动后 `start_sniffer()` —— 先按 sniffer.pid 杀旧实例
+  （防互斥量占位），再以 pythonw 分离进程拉起 wheel_sniffer.py，带
+  `--launcher-pid <pid>`；**继承启动器的管理员令牌，零额外 UAC**。
+- wheel_sniffer.py：`--launcher-pid` → tick() 连续 3 次探测启动器进程不在
+ （OpenProcess + QueryFullProcessImageNameW 防 pid 复用）→ 卸钩子 + 自尽。
+- `/stop_app`（关闭全部服务）→ stop_sniffer() + 启动器 os._exit —— 完全关闭本地服
+  = 完全关闭嗅探器。
+- **启动器已重打包并替换桌面 `尘白禁区-本地服.exe`**（旧版备份：
+  `launcher/SnowbreakLocalServer.desktop-bak-20261031.exe`）。桌面 exe 与
+  dist/SnowbreakLocalServer.exe 均为新版（10,653,088 字节）。
+- vbs（restart_sniffer_admin.vbs）保留作手动兜底。
+
+**复验清单**：双击桌面启动器（UAC 一次）→ sniffer_state.txt `hooks=on elevated=1`
+且出现于启动后数秒内；B 进拍照模式 → 键帽 UI 平滑无锯齿；游戏 Alt+F4 → UI 立即消失；
+控制台「关闭全部服务」→ pythonw 进程消失；单独跑游戏不启动本地服 → 无嗅探器（预期）。
+
+---
+
+# ★ 下一轮：景深模糊滑块（侦查已完成）
+
+Game.exe 字符串侦查：DOF 全是 **FPostProcessSettings 反射属性**
+（DepthOfFieldFstop / DepthOfFieldFocalDistance / DepthOfFieldDepthBlurRadius /
+DepthOfFieldNearTransitionRegion / DepthOfFieldFarTransitionRegion +
+bOverride_* 开关），无 r.DepthOfField cvar（r.ScreenPercentage 存在，控制台通路可用）。
+
+**方案**：给自由相机的 ACameraActor **NewObject 挂 PostProcessComponent**（UnLua
+反射设 Settings 的 bOverride_* + DepthOfField* 字段，BlendWeight=1）→ 滑块直接写
+Fstop（光圈，越小越糊）/ FocalDistance（对焦距离）。滑块 UI 需要交互模式：
+按键切换「编辑态」——overlay 去 WS_EX_TRANSPARENT 接管鼠标，钩子按「光标在
+overlay 矩形内 + 编辑态」放行 LMB（同一进程共享状态，_mouse_proc 可查），
+退出编辑态恢复穿透。**下一轮先做 Lua probe（挂组件+设字段验证模糊可见），再做滑块。**
 
 ---
 

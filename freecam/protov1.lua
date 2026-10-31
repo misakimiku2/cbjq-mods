@@ -1,5 +1,5 @@
 -- ========================================================
--- @File    : FreeCam.lua (v18)
+-- @File    : FreeCam.lua (v20)
 -- @Brief   : 游戏场景自由相机（独立于 CamZoomMod）
 --
 -- 基于 probe v1/v2 的实机结论：
@@ -33,6 +33,11 @@
 --
 -- v18 追加：ESC 退出拍照模式（操作提示窗的精装键帽版在嗅探器侧：
 --   runtime/wheel_sniffer.py 的 overlay_thread v2，GDI+ 键帽样式、无底板）。
+--
+-- v19 追加：景深模糊（F9 面板）。相机 Actor 挂 UPostProcessComponent，
+--   FPostProcessSettings 反射写 DepthOfFieldFstop/FocalDistance；
+--   滑块面板与输入在嗅探器侧（overlay v4），经 dof.txt 同步；
+--   面板打开（edit=1）时冻结相机走位，WASD 让给滑块。
 --
 -- 输入通道沿用 CamZoomSniffer 的两个文件（嗅探器与本 MOD 无关，一直在后台跑）：
 --   C:\ProgramData\CamZoomMod\fp_key.txt   "seq vk"   -- 键盘
@@ -107,11 +112,20 @@ local cfg = {
   --   死人开关、ESC 自己就触发退出解禁，不会锁死。
   -- ⚠ cfg 里同名键只能有一个：曾因残留第二个 blockList='' 把名单覆盖，
   --   表现为屏蔽整体失效且日志只有 BLOCK 0，极难排查。
-  blockList    = '1 2 10 32 17 16 160 161 162 163 81 69 90 88 82 70 71 67 86 66 84 89 85 73 79 80 72 74 75 76 77 78 188 190 191 49 50 51 52 53 54 55 56 57 48 87 65 83 68 27',
+  --   v19 追加 120(F9)：景深面板开关，游戏不该收到。
+  blockList    = '1 2 10 32 17 16 160 161 162 163 81 69 90 88 82 70 71 67 86 66 84 89 85 73 79 80 72 74 75 76 77 78 188 190 191 49 50 51 52 53 54 55 56 57 48 87 65 83 68 27 120',
   hudRehide    = 12,    -- 每隔多少帧重新压一次 UI 透明度（游戏会自己改回来）
   freezeRate   = 0.02,  -- 定格时的时间缩放；用 0.02 不用 0，避免系统级组件异常
   beatTimeout  = 15.0,  -- 嗅探器心跳停这么久 → 自动退出，防止卡死在自由相机里出不来
   minGameplay  = 1,     -- 必须处于 gameplay 才允许进入
+  -- ===== 景深（DOF, v19）=====
+  -- 给自由相机 Actor 挂 UPostProcessComponent，把引擎景深参数直接按在相机上
+  -- （AWebCameraManager 会收集 ViewTarget 上的 PP 组件）。参数由嗅探器滑块面板
+  -- 写 dof.txt（"fstop focus edit"），这里定期同步；edit=1 时冻结相机走位。
+  dofOn        = true,
+  dofPath      = 'C:\\ProgramData\\CamZoomMod\\dof.txt',
+  dofSync      = 6,     -- 每多少帧同步一次 dof.txt（20 帧在 60fps 下有 0.33s 延迟，
+                        -- 按方向键调参时手感明显发滞；6 帧 ≈ 0.1s，够跟手且 IO 可忽略）
   -- ===== 相机碰撞（v17）=====
   -- 现象：相机 Actor 无体积、位置逐帧直写，会穿过一切场景模型。
   -- 方案：每帧对「上一帧落点 → 本帧目标点」的位移做 SphereTraceSingle 球体扫掠，
@@ -155,6 +169,14 @@ local S = {
   errors = 0,
   apiLogged = false,
   colPrev = nil,        -- 上一帧碰撞解析后的落点（下一帧扫掠起点，v16）
+  dofComp = nil,        -- 景深 PostProcessComponent（v19）
+  dofVol = nil,         -- v25：世界 APostProcessVolume（唯一进得了渲染的那条路）
+  dofFstop = 2.8,
+  dofFocus = 800.0,
+  dofEdit = false,      -- 嗅探器滑块面板编辑态（edit=1 时冻结走位）
+  dofVig = 0.0,         -- v21 诊断：暗角强度（进相机前 1.5s 给一档，用来验 PP 通道）
+  dofVigT = 0,          -- v21 诊断：进相机后的帧计数
+  dofLogN = 0,          -- v21 诊断：sync 日志条数（限流，避免刷屏）
 }
 
 -- ============================================================
@@ -375,7 +397,7 @@ end
 -- 导致主循环每 12 帧报 nil 调用、MOD 整个死掉、看起来像"所有问题都回归"。
 -- 现在只隐藏根 widget 的透明度，不用 Collapse —— 游戏会自己改回来）
 local HELP = '【自由相机】鼠标 转视角 | W/A/S/D 移动 | E/Q 升降\n' ..
-             '滚轮 FOV | V 定格（时间冻结）| B 进入/退出 | ESC 退出'
+             '滚轮 FOV | V 定格（时间冻结）| B 进入/退出 | ESC 退出 | F9 景深'
 
 local function hudCollect()
   local pc = getPC()
@@ -473,6 +495,277 @@ pcall(function()
     lp('KBD n=' .. INP.n .. ' args=' .. table.concat(t, ','))
   end)
 end)
+
+-- ============================================================
+-- 景深（v19）：相机 Actor 挂 PostProcessComponent
+-- ------------------------------------------------------------
+-- 为什么不是 cvar：Game.exe 里没有 r.DepthOfField*（shipping 裁掉），DOF 全是
+-- FPostProcessSettings 的反射属性（DepthOfFieldFstop / FocalDistance /
+-- Near/FarTransitionRegion + bOverride_*）。
+-- APlayerCameraManager 会收集 ViewTarget（= 我们自己的相机 Actor）上的
+-- UPostProcessComponent 并应用 —— NewObject 挂上去即可全屏生效。
+-- 参数来自嗅探器滑块面板（dof.txt "fstop focus edit"），每 dofSync 帧同步一次；
+-- edit=1 时冻结相机走位（WASD 让给滑块）。
+-- ============================================================
+-- ============================================================
+-- 景深（v20）：CameraComponent.PostProcessSettings + 放开 DOF 核半径
+-- ------------------------------------------------------------
+-- 实测教训：
+--   * v19 挂 UPostProcessComponent 能写进 Settings（readback 一致），但游戏相机
+--     管理器不收集 ViewTarget 上的 PP 组件 → 画面无任何效果。
+--   * 正路：ACameraActor 的 UCameraComponent 自带 PostProcessSettings /
+--     PostProcessBlendWeight，GetCameraView 会把它们带进 POV → 渲染直接生效。
+--   * 即使 PP 生效，游戏启动时把 r.DOF.Kernel.MaxForegroundRadius /
+--     MaxBackgroundRadius 钳在 0.025（启动日志 LogConfig 可证）——模糊核被限死，
+--     肉眼不可见。进入自由相机时用 ExecuteConsoleCommand 提到 1.0，退出还原。
+-- 参数来自嗅探器滑块面板（dof.txt "fstop focus edit"），每 dofSync 帧同步。
+-- ============================================================
+local function dofCvars(v)
+  local ins = getIns()
+  local pc = getPC()
+  if ins == nil then return end
+  local function cmd(s)
+    local r = nil
+    pcall(function()
+      r = UE4.UKismetSystemLibrary.ExecuteConsoleCommand(ins, s, pc)
+    end)
+    return r
+  end
+  -- v22：**先把 DOF 质量拉满**。启动日志是 `r.DepthOfFieldQuality:2`，但手游改端
+  -- 为了性能常在 gameplay 里把它压成 0（关掉整套景深），启动值说明不了运行时值。
+  -- 暗角自检已证明 PostProcessSettings 能进渲染，剩下最可能就是这里被关了。
+  cmd('r.DepthOfFieldQuality 2')
+  cmd('r.DOF.Kernel.MaxForegroundRadius ' .. v)
+  cmd('r.DOF.Kernel.MaxBackgroundRadius ' .. v)
+  -- v23：真正的瓶颈在这里。游戏启动日志是一整套**廉价 DOF 配置**：
+  --   r.DOF.Recombine.Quality:1   ← 注释原文 "cheap slight out of focus"，
+  --                                  只做「轻微失焦」，光圈调到 1.4 也糊不起来
+  --   r.DOF.Gather.RingCount:4    ← 采样环数偏少
+  --   r.DOF.Scatter.MaxSpriteRatio:0.1  ← 只散射 10% 的 bokeh
+  -- 即使 DepthOfFieldQuality=2、PP 也进了管线，这三条也把模糊压到看不出。
+  cmd('r.DOF.Recombine.Quality 3')          -- 0=off 1=cheap/slight 2=medium 3=high
+  cmd('r.DOF.Gather.RingCount 7')           -- 采样环数拉满，模糊才成形
+  cmd('r.DOF.Gather.EnableBokehSettings 1')
+  cmd('r.DOF.Scatter.EnableBokehSettings 1')
+  cmd('r.DOF.Scatter.MaxSpriteRatio 1.0')
+  cmd('r.DOF.TemporalAAQuality 1')
+  -- v24：游戏是 `-FeatureLevelES31` + `r.MobileHDR:1` + `r.MobileMSAA:1`
+  -- → UE4 **移动端前向管线**，PC 那套物理光圈 DOF 基本不实现，走的是
+  -- `MobileDOF`（只认 FocalDistance / DepthBlurRadius / Near/FarTransition）。
+  -- 而且 MSAA 下 scene depth 需要 resolve 才可读，默认 `ForceDepthResolve:0`
+  -- 意味着 DOF 拿不到深度 —— 这条很可能就是「参数全对但一点不糊」的死结。
+  cmd('r.Mobile.ForceDepthResolve 1')
+end
+
+-- 单独查一次当前质量（返回值会打到日志），用来判断游戏有没有在运行时压低它。
+-- 只在进相机时查，别放进周期性重设里刷屏。
+local function dofQueryQuality()
+  local ins, pc = getIns(), getPC()
+  if ins == nil then return end
+  local q = nil
+  pcall(function()
+    q = UE4.UKismetSystemLibrary.ExecuteConsoleCommand(
+        ins, 'r.DepthOfFieldQuality', pc)
+  end)
+  lp('DOF quality=' .. tostring(q))
+end
+
+-- v25：DOF 字段填充（相机组件与 Volume 共用同一套参数）
+local function fillDof(st, blurR)
+  pcall(function() st.bOverride_DepthOfFieldFstop = true end)
+  pcall(function() st.DepthOfFieldFstop = S.dofFstop end)
+  pcall(function() st.bOverride_DepthOfFieldFocalDistance = true end)
+  pcall(function() st.DepthOfFieldFocalDistance = S.dofFocus end)
+  pcall(function() st.bOverride_DepthOfFieldNearTransitionRegion = true end)
+  pcall(function() st.DepthOfFieldNearTransitionRegion = 80.0 end)
+  pcall(function() st.bOverride_DepthOfFieldFarTransitionRegion = true end)
+  pcall(function() st.DepthOfFieldFarTransitionRegion = 500.0 end)
+  pcall(function() st.bOverride_DepthOfFieldDepthBlurRadius = true end)
+  pcall(function() st.DepthOfFieldDepthBlurRadius = blurR end)
+  pcall(function() st.bOverride_DepthOfFieldDepthBlurAmount = true end)
+  pcall(function() st.DepthOfFieldDepthBlurAmount = 1.0 end)
+  pcall(function() st.bOverride_DepthOfFieldMinFstop = true end)
+  pcall(function() st.DepthOfFieldMinFstop = 1.0 end)
+  pcall(function() st.bOverride_DepthOfFieldFocalRegion = true end)
+  pcall(function() st.DepthOfFieldFocalRegion = 0.0 end)
+end
+
+local function applyDof(force)
+  local c = S.dofComp
+  local vol = S.dofVol
+  if c == nil and vol == nil then return end
+  -- 强度跟着 fstop 走（1.4 → 1.0 最糊，16 → 0 最清晰）
+  local blurR = (16.0 - S.dofFstop) / 14.6
+  if blurR < 0 then blurR = 0 end
+  if blurR > 1 then blurR = 1 end
+  -- 路径 1：相机组件（v24 的 POV 诊断证明它进不了渲染，保留仅作对照）
+  if c ~= nil then
+    local st = nil
+    pcall(function() st = c.PostProcessSettings end)
+    if st ~= nil then
+      fillDof(st, blurR)
+      pcall(function() c.PostProcessSettings = st end)   -- 链式写穿不可靠时兜底回写
+    end
+    pcall(function() c.PostProcessBlendWeight = 1.0 end)
+  end
+  -- 路径 2：世界里的 PostProcessVolume（v25 新增，真正会进渲染的那条）。
+  -- FSceneView 从 WorldSettings->PostProcessVolumes 收集，不经过 ViewTarget POV，
+  -- 所以不受「游戏不采用 CameraActor 的 PP」影响。
+  if vol ~= nil then
+    local st2 = nil
+    pcall(function() st2 = vol.Settings end)
+    if st2 ~= nil then
+      fillDof(st2, blurR)
+      pcall(function() vol.Settings = st2 end)
+    end
+    pcall(function() vol.BlendWeight = 1.0 end)
+    pcall(function() vol.bUnbound = true end)
+  end
+  if force then
+    local rb, rb2, bw = nil, nil, nil
+    pcall(function() rb = c.PostProcessSettings.DepthOfFieldFstop end)
+    pcall(function() rb2 = c.PostProcessSettings.DepthOfFieldFocalDistance end)
+    pcall(function() bw = c.PostProcessBlendWeight end)
+    lp('DOF apply fstop=' .. fmt(S.dofFstop, 2) .. ' focus=' .. fmt(S.dofFocus, 0) ..
+       ' readback=' .. tostring(rb) .. '/' .. tostring(rb2) .. ' w=' .. tostring(bw))
+    -- ViewTarget 是不是我们 spawn 的相机？不是的话 PP 写得再对也没用
+    local vtag = 'nil'
+    pcall(function()
+      local pc0 = getPC()
+      if pc0 ~= nil then
+        local vt = pc0:GetViewTarget()
+        if vt ~= nil then
+          local n = nil
+          pcall(function() n = UE4.UKismetSystemLibrary.GetDisplayName(vt) end)
+          vtag = tostring(n)
+        end
+      end
+    end)
+    lp('DOF vtag=' .. vtag .. ' vig=' .. fmt(S.dofVig, 1))
+    -- v24：直接读 POV 里的值。相机组件上的 readback 只能证明结构体本身写成功，
+    -- 真正决定渲染的是 PlayerCameraManager 的 CameraCache.POV ——
+    -- povFocal 仍是 0 就说明 PP 压根没进 POV（得改走 PostProcessVolume）；
+    -- 有值就说明渲染端拿到了参数，问题在移动端管线的实现。
+    local povF, povW = nil, nil
+    pcall(function()
+      local pc0 = getPC()
+      if pc0 == nil then return end
+      local pcm = pc0.PlayerCameraManager
+      if pcm == nil then return end
+      local pov = pcm.CameraCache.POV
+      if pov == nil then return end
+      pcall(function() povF = pov.PostProcessSettings.DepthOfFieldFocalDistance end)
+      pcall(function() povW = pov.PostProcessBlendWeight end)
+    end)
+    lp('DOF povFocal=' .. tostring(povF) .. ' povW=' .. tostring(povW))
+    -- v25：Volume 侧的读回（这条通了才有意义）
+    local vrb, vw = nil, nil
+    pcall(function() vrb = vol.Settings.DepthOfFieldFocalDistance end)
+    pcall(function() vw = vol.BlendWeight end)
+    lp('DOF vol=' .. tostring(vol ~= nil) .. ' volFocal=' .. tostring(vrb) ..
+       ' volW=' .. tostring(vw))
+  else
+    -- 值变化时的同步日志（限流 20 条）：确认 dof.txt → Lua 这条链是通的
+    S.dofLogN = (S.dofLogN or 0) + 1
+    if S.dofLogN <= 20 then
+      local rb1, rb3 = nil, nil
+      pcall(function() rb1 = c.PostProcessSettings.DepthOfFieldFstop end)
+      pcall(function() rb3 = c.PostProcessSettings.VignetteIntensity end)
+      lp('DOF sync f=' .. fmt(S.dofFstop, 2) .. ' d=' .. fmt(S.dofFocus, 0) ..
+         ' rb=' .. tostring(rb1) .. ' rbVig=' .. tostring(rb3))
+    end
+  end
+end
+
+local function readDofFile()
+  local n = nums(readFile(cfg.dofPath))
+  if n == nil or n[1] == nil then return false end
+  local f = n[1]
+  local d = n[2] or S.dofFocus
+  if f < 1.2 then f = 1.2 end
+  if f > 16.0 then f = 16.0 end
+  if d < 50 then d = 50 end
+  if d > 8000 then d = 8000 end
+  local changed = (f ~= S.dofFstop or d ~= S.dofFocus)
+  S.dofFstop, S.dofFocus = f, d
+  S.dofEdit = (n[3] == 1)
+  return changed
+end
+
+-- v25：世界 PostProcessVolume。POV 诊断已证明 CameraActor 的 PP 进不了渲染
+-- （povFocal=0 / povW=0），Volume 是唯一绕开 ViewTarget 的全屏后处理入口 ——
+-- FSceneView 从 WorldSettings->PostProcessVolumes 收集，跟 POV 无关。
+local function setupDofVolume()
+  if S.dofVol ~= nil then return end
+  local ins = getIns()
+  if ins == nil then
+    lp('PPVOL no ins')
+    return
+  end
+  local world = nil
+  pcall(function() world = UE4.UGameplayStatics.GetGameWorld(ins) end)
+  if world == nil then
+    pcall(function() world = ins:GetWorld() end)
+  end
+  if world == nil then
+    lp('PPVOL no world')
+    return
+  end
+  local vol = nil
+  -- UnLua 只能调 UFUNCTION：`UWorld::SpawnActor` 是 C++ 模板、没暴露，
+  -- 优先走 `UGameplayStatics.BeginDeferredActorSpawnFromClass`（BlueprintCallable）。
+  local tr = nil
+  pcall(function() tr = S.camActor:GetActorTransform() end)
+  if tr == nil then
+    pcall(function()
+      tr = UE4.FTransform(UE4.FRotator(0, 0, 0), UE4.FVector(0, 0, 0),
+                          UE4.FVector(1, 1, 1))
+    end)
+  end
+  if tr ~= nil then
+    pcall(function()
+      vol = UE4.UGameplayStatics.BeginDeferredActorSpawnFromClass(
+              ins, UE4.APostProcessVolume, tr, 0, nil)
+    end)
+    if vol ~= nil then
+      pcall(function()
+        UE4.UGameplayStatics.FinishSpawningActor(vol, tr)
+      end)
+    end
+  end
+  if vol == nil then
+    -- 兜底：万一反射里真有 SpawnActor
+    pcall(function()
+      vol = world:SpawnActor(UE4.APostProcessVolume,
+                             UE4.FVector(0, 0, 0),
+                             UE4.FRotator(0, 0, 0),
+                             UE4.FActorSpawnParameters())
+    end)
+  end
+  if vol == nil then
+    lp('PPVOL spawn failed')
+    return
+  end
+  pcall(function() vol.bUnbound = true end)      -- 全屏生效，不需要包围盒
+  pcall(function() vol.bEnabled = true end)
+  pcall(function() vol.BlendWeight = 1.0 end)
+  S.dofVol = vol
+  local ub = nil
+  pcall(function() ub = vol.bUnbound end)
+  lp('PPVOL spawned unbind=' .. tostring(ub))
+end
+
+local function setupDof()
+  setupDofVolume()           -- 先建 Volume：不依赖相机组件，POV 那条路已证伪
+  S.dofComp = S.camComp
+  dofQueryQuality()          -- 先看一眼运行时质量（日志 DOF quality=）
+  dofCvars('1.0')            -- 放开模糊核上限（游戏默认 0.025，肉眼不可见）
+  readDofFile()
+  applyDof(true)
+  if S.dofComp == nil then
+    lp('DOF no CameraComponent (volume-only mode)')
+  end
+end
 
 -- ============================================================
 -- 进入 / 退出
@@ -573,6 +866,13 @@ local function enter()
   -- ⚠ 带鱼屏黑边：ACameraActor 默认 bConstrainAspectRatio=true（按 16:9 锁比例），
   -- 21:9 屏上就会左右留出黑边。关掉它，让引擎按实际视口比例出画面。
   applyAspect(S.camComp)
+  -- 景深组件（失败不影响相机本体，日志有 DOF 前缀可查）
+  S.dofVig = 0.0          -- v21：每次进相机重置暗角自检状态
+  S.dofVigT = 0
+  S.dofLogN = 0
+  if cfg.dofOn then
+    pcall(setupDof)
+  end
   S.pos = start
   S.colPrev = { X = start.X, Y = start.Y, Z = start.Z }  -- 碰撞扫掠起点（v16）
   S.yaw = yaw
@@ -644,6 +944,20 @@ local function exit(reason)
 
   -- UI 还原（退出时一定要做，否则 HUD 会一直隐形）
   hudRestore()
+  -- 景深还原：blend 归零 + 核半径恢复游戏默认
+  if S.dofComp ~= nil then
+    pcall(function() S.dofComp.PostProcessBlendWeight = 0.0 end)
+    S.dofComp = nil
+  end
+  -- v25：销毁我们 spawn 的 PostProcessVolume，别把景深留在游戏世界里
+  if S.dofVol ~= nil then
+    pcall(function() S.dofVol.BlendWeight = 0.0 end)
+    pcall(function() S.dofVol:K2_DestroyActor() end)
+    S.dofVol = nil
+  end
+  if cfg.dofOn then
+    pcall(function() dofCvars('0.025') end)
+  end
   writeBlock('0')
   writeOverlay('0')
   toast('已退出自由相机', 1.2)
@@ -939,9 +1253,10 @@ local function update(dt, pc, pcm)
   local axisUp = axisVal(pc, 'MoveUp')
   if axisUp ~= nil then vu = axisUp end
 
-  if mf ~= 0 or mr ~= 0 or vu ~= 0 or
-     (held ~= nil and (held[cfg.upVK] or held[cfg.downVK] or
-                       held[cfg.altUpVK] or held[cfg.altDownVK])) then
+  if not S.dofEdit and
+     (mf ~= 0 or mr ~= 0 or vu ~= 0 or
+      (held ~= nil and (held[cfg.upVK] or held[cfg.downVK] or
+                        held[cfg.altUpVK] or held[cfg.altDownVK]))) then
     local rot = UE4.UKismetMathLibrary.MakeRotator(0, S.pitch, S.yaw)
     local fwd, rgt = nil, nil
     local okF, f = pcall(UE4.UKismetMathLibrary.GetForwardVector, rot)
@@ -973,6 +1288,28 @@ local function update(dt, pc, pcm)
       S.pos = { X = S.pos.X + dx, Y = S.pos.Y + dy, Z = S.pos.Z + dz }
       S.moved = (S.moved or 0) + 1
       if S.moved <= 3 then lp('MOVE mf=' .. fmt(mf, 2) .. ' mr=' .. fmt(mr, 2)) end
+    end
+  end
+
+  -- 3.4) v23：周期性补关键 cvar。游戏切场景/进战斗会把 DOF 性能档打回默认
+  --      （Recombine.Quality 回 1 = 轻微失焦、Max*Radius 回 0.025 = 核半径锁死），
+  --      只设一次的话过一会儿又没效果。10 秒补一刀，只补这三条避免刷日志。
+  if S.dofComp ~= nil and S.frame % 600 == 0 then
+    local ins0, pc0 = getIns(), getPC()
+    if ins0 ~= nil then
+      pcall(UE4.UKismetSystemLibrary.ExecuteConsoleCommand, ins0,
+            'r.DOF.Kernel.MaxForegroundRadius 1.0', pc0)
+      pcall(UE4.UKismetSystemLibrary.ExecuteConsoleCommand, ins0,
+            'r.DOF.Kernel.MaxBackgroundRadius 1.0', pc0)
+      pcall(UE4.UKismetSystemLibrary.ExecuteConsoleCommand, ins0,
+            'r.DOF.Recombine.Quality 3', pc0)
+    end
+  end
+
+  -- 3.5) 景深参数同步（嗅探器滑块面板 → dof.txt → 这里应用）
+  if S.dofComp ~= nil and S.frame % cfg.dofSync == 0 then
+    if readDofFile() then
+      applyDof(false)
     end
   end
 
@@ -1157,7 +1494,7 @@ FreeCam.Start = function()
   local ok = pcall(function() UE4.Timer.Add(0.5, loop) end)
   if ok then
     _started = true
-    lp('freecam v18 online  B=开关自由相机  ESC=退出  V=定格  鼠标=转视角  WASD=走位  滚轮=FOV  碰撞=开')
+    lp('freecam v20 online  B=开关  ESC=退出  V=定格  WASD=走位  滚轮=FOV  碰撞=开  F9=景深')
   end
 end
 
@@ -1178,6 +1515,6 @@ pcall(function()
   end)
 end)
 
-lp('freecam v18 injected (FreeCamActive flag on)')
+lp('freecam v20 injected (FreeCamActive flag on)')
 
 end -- FreeCam guard

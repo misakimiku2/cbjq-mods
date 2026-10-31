@@ -77,19 +77,50 @@ const namesOff = Number(toc.readBigInt64LE(p)) - indexOff; p += 16;
 p += 24;
 const baseEntry = p;
 
-// ---- 名字表（顺序未知，仅作参考；先按顺序猜） ----
+// ---- 名字表（2026-10-31 修正：结构化解析，替代旧的盲扫猜配对）----
+// 实测结构：若干 [u32 dirLen][目录串(以/结尾)][u32 fileCount]
+//           然后(fileCount 个) [u32 nameLen][文件名\0][u32 entryRel]
+// 名字记录自带的 entryRel 才是名字↔条目的权威映射；旧版按顺序盲扫在带目录的包里会错位，
+// 导致解出的文件名张冠李戴（内容本身没问题，数据区仍按 hash 记录取）。
 function parseNames() {
-  const out = [];
-  let q = namesOff;
-  const end = Math.min(toc.length, namesOff + 0x100000);
-  while (q + 4 < end && out.length < files) {
-    const len = toc.readInt32LE(q);
-    if (len <= 0 || len > 300 || q + 4 + len > end) { q += 4; out.push(null); continue; }
-    const s = toc.subarray(q + 4, q + 4 + len - 1).toString('latin1');
-    if (/[\x00-\x1f]/.test(s)) { q += 4; out.push(null); continue; }
-    out.push(s);
-    q += 4 + len;
-    q += 4; // 名字后跟一个 uint32（用途未定，跳过）
+  const region = toc.subarray(namesOff);
+  const isDirStr = (q) => {
+    if (q + 8 > region.length) return -1;
+    const len = region.readUInt32LE(q);
+    if (len < 3 || len > 200 || q + 4 + len > region.length) return -1;
+    const s = region.subarray(q + 4, q + 4 + len).toString('latin1');
+    if (s.charCodeAt(s.length - 1) !== 0) return -1;
+    const c = s.slice(0, -1);
+    return (/^[A-Za-z0-9_\-./]+$/.test(c) && c.endsWith('/') && c.includes('/')) ? len : -1;
+  };
+  const byRel = new Map();
+  let i = 0;
+  while (i < 0x100 && i + 8 <= region.length && isDirStr(i) < 0) i++;
+  let dir = '';
+  while (i + 8 <= region.length) {
+    const dl = isDirStr(i);
+    if (dl > 0) {
+      dir = region.subarray(i + 4, i + 4 + dl - 1).toString('latin1');
+      i += 4 + dl;
+      if (i + 4 > region.length) break;
+      const fileCount = region.readUInt32LE(i); i += 4;
+      for (let k = 0; k < fileCount && i + 8 <= region.length; k++) {
+        const nl = region.readUInt32LE(i); i += 4;
+        if (nl < 5 || nl > 250 || i + nl + 4 > region.length) break;
+        const nm = region.subarray(i, i + nl).toString('latin1');
+        i += nl;
+        const rel = region.readUInt32LE(i); i += 4;
+        byRel.set(rel, { dir, name: nm.replace(/\0$/, '') });
+      }
+      continue;
+    }
+    i++;
+  }
+  // hash 记录 i 的 rel → 名字（名字区与 hash 区顺序不同，rel 是唯一桥梁）
+  const out = new Array(files).fill(null);
+  for (let r = 0; r < files; r++) {
+    const rel = toc.readUInt32LE(hashesOff + 4 + r * 12 + 8);
+    out[r] = byRel.get(rel) || null;
   }
   return out;
 }
@@ -172,7 +203,8 @@ for (let i = 0; i < files && ok + fail < LIMIT; i++) {
     }
   }
 
-  const name = names[i] || `f${String(i).padStart(5, '0')}`;
+  const nm = names[i];
+  const name = nm ? (nm.dir ? nm.dir : '') + nm.name : `f${String(i).padStart(5, '0')}`;
   ok++;
   const info = { i, name, pak: path.basename(pakPath), dataOff: entry.dataOff, size: data.length, usz: res.usz, method: res.method };
   manifest.push(info);
