@@ -11,6 +11,83 @@
 
 ---
 
+# 📌 后续方案（已定）：景深改走 Reshade（2026-11-01 02:2x 记录）
+
+## 为什么放弃引擎内实现
+
+| 尝试 | 结果 |
+|---|---|
+| `UCameraComponent.PostProcessSettings` | 写入成功但 POV 里是 0（`povFocal=0/povW=0`），渲染端不采用 |
+| 世界 `APostProcessVolume`（`bUnbound` + `Priority=100`） | 创建/参数/优先级全对，画面无任何变化 |
+| 全部 DOF cvar（Quality/Recombine/RingCount/Bokeh/Max*Radius/ForceDepthResolve） | 日志回显确认生效，画面无变化 |
+| 自定义 PP 材质（`WeightedBlendables` + MID） | 材质 domain 不兼容，**按 B 直接崩溃**（调用栈在渲染线程） |
+
+**结论**：`-FeatureLevelES31` + `r.MobileHDR:1` 的 UE4 Mobile 管线在这套游戏里
+没有编 DOF 与 PP 材质这两块。宿舍拍照模式同样没有景深，印证项目本身没做。
+
+## Reshade 方案（待实施）
+
+- **原理**：注入 D3D11（游戏后端就是 D3D11，`-FeatureLevelES31` 不影响），
+  读**深度缓冲**做真实景深，完全绕开游戏后处理。
+- **shader 选择**：
+  - `CinematicDOF.fx` —— 更接近真实相机镜头（光圈/焦距/焦外形状可调），首选；
+  - `MagicDOF.fx` —— 轻量、参数少，性能好，备选。
+- **初始参数方向**：对焦距离跟随相机到主体的距离（人像 200–400cm）、
+  F-stop 1.4–2.8、焦外强度中等；拍照时用快捷键开关。
+- **前置条件**：装 Reshade 5.x（选 D3D11），把 shader 放进 `reshade-shaders/Shaders`。
+- **风险**：全局生效（战斗也会糊），必须配开关；私服无 ACE，注入冲突风险低。
+- **决定**：用户说「后面再弄」，本轮不实施。
+
+---
+
+# ★ v28：引擎 DOF 彻底证伪，改挂现成后处理材质（RadialBlur）
+
+**v27 结果**：日志 `PPVOL priority=100.0` 确认设置成功，`DOF vol=true volFocal=6080 volW=1`
+参数也对，**画面依旧毫无变化**。
+
+**结论（可以钉死了）**：`-FeatureLevelES31` + `r.MobileHDR:1` 的 UE4 Mobile 管线
+在这套游戏里**不实现 DOF 后处理**，不是参数、不是优先级、不是传递路径的问题。
+宿舍拍照模式也没有景深（用户去确认过），说明项目本身就没做这个功能。
+
+## v28 方案：绕开引擎 DOF，挂 Post Process 材质
+
+从 `work/_matresearch/out_true/` 里翻到一个 ImageEffects 系列材质，
+并从 uasset 头部解析出真实包路径：
+
+```
+/Game/Materials/ImageEffects/RadialBlur/radial_blur_mat
+/Game/Materials/ImageEffects/RadialBlur/radial_blur_inst
+```
+
+`ImageEffects` 前缀 + Domain = Post Process，走
+`PostProcessSettings.WeightedBlendables` 进后处理链 —— **完全不经过引擎的 DOF 实现**。
+效果是径向模糊（中心清晰、四周虚化），不是深度景深，但拍照构图可用。
+
+**实现要点（都很容易踩空）**：
+
+1. **UE4.26 没有 `UKismetSystemLibrary.LoadAsset`**（那是 UE5 才加的）。UnLua 里
+   加载资产的入口不确定，所以一次试 5 种：
+   `UKismetSystemLibrary.LoadAsset` / `UE4.LoadObject` / `UE4.UObject.Load` /
+   `FSoftObjectPath(p):TryLoad()` / `UGameplayStatics.LoadAsset`，
+   谁成功日志记 `PPVOL mat[n]=<路径>`。
+2. `FWeightedBlendable` 两种构造都试：`(1.0, mat)` 与无参 + 逐字段赋值。
+3. 挂载后 `vol.Settings.WeightedBlendables = wbs` 回写。
+
+pak **363,033 字节**已安装。
+
+## 判定
+
+| 日志 | 含义 |
+|---|---|
+| `PPVOL mat[n]=…` + `blendable added` | 材质挂上了 → 看画面有没有径向模糊 |
+| `PPVOL mat not found` | 5 种加载入口都不通，需要换（AssetManager / 蓝图预引用） |
+| `blendable build failed` | 结构体构造失败，改 table 直接 Add |
+
+**如果材质挂上、`blendable added` 也打了，画面还是纹丝不动** —— 那说明移动端连
+PP 材质通道都被裁了，引擎层面基本无解，只能考虑改 pak 里的渲染配置或放弃景深。
+
+---
+
 # ⏸ v26 结论：参数链全通，渲染端不消费 —— DOF 暂停，转查宿舍拍照模式
 
 **最后一版（v25 Volume）的日志**：

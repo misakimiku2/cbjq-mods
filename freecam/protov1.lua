@@ -620,6 +620,7 @@ local function applyDof(force)
     end
     pcall(function() vol.BlendWeight = 1.0 end)
     pcall(function() vol.bUnbound = true end)
+    pcall(function() vol.Priority = 100 end)     -- v27：压过游戏自带的 unbound volume
   end
   if force then
     local rb, rb2, bw = nil, nil, nil
@@ -749,9 +750,19 @@ local function setupDofVolume()
   pcall(function() vol.bUnbound = true end)      -- 全屏生效，不需要包围盒
   pcall(function() vol.bEnabled = true end)
   pcall(function() vol.BlendWeight = 1.0 end)
+  -- v27：**优先级**。游戏自己一定有自己的 unbound volume（场景调色），
+  -- Priority 更高的会盖掉低的；不设就是 0，等于白挂。
+  pcall(function() vol.Priority = 100 end)
+  -- v30：材质挂载整段已移除。v29 把 ImageEffects_RadialBlur 挂进
+  -- WeightedBlendables 并套了动态材质实例，实机按 B 直接崩（调用栈落在渲染线程）。
+  -- 该材质大概率是 UI domain，塞进后处理链会让渲染器访问非法材质。
+  -- 引擎内的 DOF 与 PP 材质两条路都已判死，不再尝试。
   S.dofVol = vol
   local ub = nil
   pcall(function() ub = vol.bUnbound end)
+  local vp = nil
+  pcall(function() vp = vol.Priority end)
+  lp("PPVOL priority=" .. tostring(vp))
   lp('PPVOL spawned unbind=' .. tostring(ub))
 end
 
